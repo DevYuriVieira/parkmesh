@@ -19,6 +19,7 @@ public static class DependencyInjection
         services.AddSingleton(_ => StandardTopologyFactory.CreateStandardGarage());
         services.AddSingleton<IPathfinder, AStarPathfinder>();
         services.AddSingleton<IEdgeCongestionTracker, InMemoryEdgeCongestionTracker>();
+        services.AddSingleton<IEngineMetricsRecorder, EngineMetricsRecorder>();
         services.AddSingleton<IParkingAllocationService, ParkingAllocationService>();
         return services;
     }

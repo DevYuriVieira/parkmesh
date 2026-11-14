@@ -94,6 +94,9 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
 
     public bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId) => false;
 
+    public ValueTask<bool> UpdateVehicleProgressAsync(string vehicleSessionId, string currentNodeId, CancellationToken ct = default) =>
+        ValueTask.FromResult(false);
+
     public IReadOnlyCollection<ActiveVehicleSession> GetActiveSessions() => Array.Empty<ActiveVehicleSession>();
 
     public void Dispose() => _httpClient.Dispose();

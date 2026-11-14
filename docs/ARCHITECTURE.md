@@ -1,159 +1,112 @@
-# ParkMesh — Blueprint Arquitetural
+# ParkMesh Architecture Blueprint
 
-## 1. Visão Arquitetural: Modular Monolith + Workers Dedicados
+## 1. Architectural Vision & Style
 
-Para manter latência sub-10ms no caminho crítico (`Cancela → A* → Redis Lease → SignalR`) sem adicionar *hops* de rede desnecessários entre microsserviços, o `ParkMesh` é estruturado como um **Modular Monolith** com separação de processos onde há separação real de carga:
+**ParkMesh** follows a **Modular Monolith + Dedicated Edge Workers** architecture built on **.NET 10 / C# 14**. Rather than introducing premature microservice serialization boundaries inside the latency-sensitive pathfinding and lease-acquisition critical path, core domain logic runs inside a single cohesive engine (`ParkMesh.Api`), while I/O-bound edge workloads (`ParkMesh.TelemetryWorker`, `ParkMesh.Simulator`) run as isolated `.NET Worker` processes communicating over MQTT and HTTP/JSON.
 
-```text
-[Simulador / Sensores IoT] ──MQTT──► [ParkMesh.TelemetryWorker]
-                                              │ (Channel<T> + Debounce)
-[Cancela / GateFlow (HTTP/MQTT)] ────────────►▼
-                                     [ParkMesh.Api / Engine] ◄──► [Redis (Leases + Cache)]
-                                       │               │
-                                    SignalR          EF Core
-                                   (Deltas)            │
-                                       ▼               ▼
-                             [Dashboard Visual]   [PostgreSQL]
-```
-
-### Estrutura da Solution (`ParkMesh.sln`)
-
-```text
-ParkMesh/
-├── src/
-│   ├── ParkMesh.Domain/            # Grafo, Nós/Arestas, Vagas, Perfis de Veículo, Regras de Domínio
-│   ├── ParkMesh.Application/       # Motor A*, Orquestrador de Alocação, Re-roteamento, Contratos
-│   ├── ParkMesh.Infrastructure/    # Redis Lua Leases, MQTTnet Client, PostgreSQL/EF Core, OTel
-│   ├── ParkMesh.Api/               # REST Endpoints, SignalR Hub (/hubs/parking), Health/Metrics
-│   ├── ParkMesh.TelemetryWorker/   # Worker de ingestão MQTT + Bounded Channel + Anti-Flapping
-│   └── ParkMesh.Simulator/         # Simulador de chegadas, movimento nas arestas e sensores/ruído
-├── tests/
-│   ├── ParkMesh.UnitTests/         # A*, pesos dinâmicos, heurística, debounce, regras de vaga
-│   └── ParkMesh.IntegrationTests/  # Testcontainers (Redis, PostgreSQL, Mosquitto/EMQX) + corridas
-├── web/                            # Dashboard & Simulador Visual 2D Multi-Andar (SignalR Client)
-├── infra/
-│   └── docker-compose.yml          # Mosquitto/EMQX, Redis, PostgreSQL, Prometheus, Grafana, Jaeger
-└── docs/
-    └── ARCHITECTURE.md
+```mermaid
+flowchart LR
+    Sim["ParkMesh.Simulator\n(Vehicles, Noise, Intruders)"] -->|MQTT Raw Telemetry| Mosq["Eclipse Mosquitto\n(MQTT Broker)"]
+    Mosq -->|parkmesh/v1/.../telemetry| Worker["ParkMesh.TelemetryWorker\n(BoundedChannel + Anti-Flapping)"]
+    Worker -->|Confirmed Transitions HTTP| Api["ParkMesh.Api\n(Allocation Engine + SignalR + OTel)"]
+    Api <-->|Atomic Lua SET NX + Fencing Token| Redis["Redis\n(Distributed Leases & Ephemeral State)"]
+    Api -->|MQTT LED Commands| Mosq
+    Api <-->|WebSockets /hubs/parking Deltas| Web["web/\n(2D Multi-Floor Canvas Simulator)"]
 ```
 
 ---
 
-## 2. Modelagem do Grafo Multi-Andar & Algoritmo A\*
+## 2. Solution Modules & Responsibilities
 
-O estacionamento é modelado como um **grafo direcionado ponderado** $G = (V, E)$ carregado em memória para leitura rápida e persistido/versionado em banco para topologia.
-
-### Tipos de Nós (`GraphNode`)
-- `Gate`: Ponto de entrada/saída (cancela).
-- `Intersection`: Cruzamento de corredores; pode conter um **Painel de LED** associado que aponta a próxima direção dominante.
-- `Ramp`: Transição unidirecional ou bidirecional entre andares (`Floor z -> z ± 1`).
-- `Bay`: Nó folha representando uma baia física com atributos:
-  - `BayId` (ex.: `F2-B14`)
-  - `Floor`
-  - `AllowedTypes` (`Standard`, `EV`, `SUV`, `PCD`, `Moto`)
-  - `Status` (`Free`, `Leased`, `Occupied`, `OutOfService`)
-  - `Position (X, Y, Floor)`
-
-### Função de Custo das Arestas (`EdgeWeight`)
-O custo de atravessar uma aresta $e = (u, v)$ é dinâmico:
-
-$$\text{cost}(u, v) = \text{baseDistance}(u, v) \times \text{rampPenalty}(e) + \text{congestionFactor}(e)$$
-
-- **Mão única:** Arestas respeitam sentido de tráfego dos corredores.
-- **Penalidade de rampa:** Mudar de andar custa mais do que andar no mesmo pavimento.
-- **Congestionamento dinâmico:** Veículos atualmente roteados sobre a aresta $e$ somam um fator temporário ao peso, evitando que 20 carros recebam exatamente o mesmo corredor gargalo.
-- **Heurística $h(n)$:** Distância Manhattan/Euclidiana até a vaga candidata + custo mínimo por diferença de andar (admissível para o A\*).
-
-### Seleção da Vaga Ideal
-Em vez de rodar A\* para toda vaga individualmente, usa-se **busca multi-alvo (ou pré-filtro espacial + A\* reverso/direto)**:
-1. Filtra vagas `Free` compatíveis com o `VehicleType`.
-2. Seleciona os $K$ melhores candidatos por distância heurística (ou roda Dijkstra/A\* multi-destino a partir da cancela parando nos primeiros $N$ alvos válidos).
-3. Tenta adquirir o **Lease no Redis** em ordem de menor custo real até conseguir o lock atômico.
+| Project / Directory | Layer | Primary Responsibilities |
+| :--- | :--- | :--- |
+| `src/ParkMesh.Domain` | Domain | Multi-floor weighted directed graph (`ParkingGraph`, `GraphNode`, `GraphEdge`, `ParkingBay`, `ParkingRoute`, `StandardTopologyFactory`), domain enums (`BayStatus`, `VehicleType`, `NodeType`, `DirectionHint`). Zero external dependencies. |
+| `src/ParkMesh.Application` | Application | `AStarPathfinder` (`IPathfinder`), `ParkingAllocationService`, `IEdgeCongestionTracker`, `TelemetryIngestionChannel`, `SensorReadingFilter`, `SensorTelemetryProcessor`, `EngineMetricsRecorder` (`SlidingLatencyWindow`, OTel `Meter` & `ActivitySource`), `IParkingEventSink`. |
+| `src/ParkMesh.Infrastructure` | Infrastructure | `RedisBayLeaseManager` & `LuaScripts` (atomic Redis Lua leases + monotonic fencing tokens), `InMemoryBayLeaseManager`, `MqttConnectionManager`, `MqttTelemetryHostedService`, `MqttLedPanelPublisher`, DI wiring. |
+| `src/ParkMesh.Api` | Presentation / Host | Minimal APIs (`/api/parking/...`), `ParkingHub` (`/hubs/parking`), `SignalRParkingEventSink`, `MetricsBroadcastHostedService`, static serving of `web/` at `/`, OpenTelemetry tracing & metrics (`OTLP` export when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured). |
+| `src/ParkMesh.TelemetryWorker` | Edge Worker | Subscribes to raw MQTT sensor frames, filters chatter via `SensorTelemetryProcessor`, and forwards confirmed bay occupancy transitions via `RemoteEngineAllocationProxy`. |
+| `src/ParkMesh.Simulator` | Simulator Worker | Generates concurrent vehicle arrivals, sensor flapping noise, simulated vehicle progress steps, and physical bay intrusions against MQTT + REST. |
+| `web/` | Visual UI | Zero-build HTML5 Canvas 2D multi-floor renderer (`app.js`), custom SignalR JSON WebSocket client (`signalr-lite.js`), Auto-Demo loop, chaos triggers, and P50/P95/P99 telemetry HUD. |
 
 ---
 
-## 3. Concorrência Crítica: Lease + Fencing Token no Redis
+## 3. Core Subsystems
 
-Em vez de depender de *RedLock* puro para corretude física, o `ParkMesh` combina:
-1. **Lease atômico no Redis** com expiração automática de **90 segundos** (`EX 90`).
-2. **Fencing Token monotônico** (`INCR parkmesh:fence:{bayId}`) devolvido na aquisição, garantindo que apenas a alocação mais recente possa confirmar ou liberar aquela reserva.
-3. **Reconciliação por evento físico do sensor:** Se outro carro entrar fisicamente na vaga reservada, o sensor soberano ganha e dispara o re-roteamento do veículo lesado.
+### 3.1 Multi-Floor Weighted Directed Graph & A\* Pathfinding
 
-### Contrato do Script Lua (`acquire_bay_lease.lua`)
-```lua
--- KEYS[1] = "parkmesh:lease:bay:{bayId}"
--- KEYS[2] = "parkmesh:fence:bay:{bayId}"
--- ARGV[1] = vehicleSessionId
--- ARGV[2] = ttlSeconds (90)
+The parking facility is modeled in memory as a weighted directed graph $G = (V, E)$ via `StandardTopologyFactory.CreateStandardGarage()` (`3` floors: `0`, `1`, `2`; `120` parking bays):
 
-if redis.call("EXISTS", KEYS[1]) == 1 then
-    return {0, 0}
-end
+- **Vertices ($V$)**: Entry gates (`NodeType.Gate`), lane intersections (`NodeType.Intersection`), inter-floor helical ramps (`NodeType.Ramp`), and individual bays (`NodeType.Bay`).
+- **Edges ($E$)**: Directed `GraphEdge` segments carrying base distance/weight (`BaseWeight`), length, lane capacity (`Capacity`), optional ramp metadata (`IsRamp`), and dynamic congestion cost adjustments via `IEdgeCongestionTracker`.
+- **A\* Search (`AStarPathfinder`)**: Uses a `PriorityQueue<string, double>` with an admissible Euclidean heuristic incorporating vertical floor elevation cost, ensuring optimal shortest-cost routes while dynamically steering around congested aisles.
 
-local token = redis.call("INCR", KEYS[2])
-local payload = ARGV[1] .. ":" .. tostring(token)
-redis.call("SET", KEYS[1], payload, "EX", tonumber(ARGV[2]))
-return {1, token}
-```
+### 3.2 Atomic Bay Allocation, Fencing Tokens & Live Rerouting
 
-### Cenário de Corrida Física & Re-roteamento Ao Vivo
-1. Sessão `V1` adquire `Lease(F1-B08, token=42, ttl=90s)` e segue pela rota `[G1 -> N2 -> N5 -> F1-B08]`.
-2. Um motorista intruso (sem reserva) estaciona em `F1-B08`.
-3. O sensor publica `Occupied` via MQTT.
-4. O motor detecta que `F1-B08` estava `Leased` para `V1`:
-   - Invalida o lease no Redis (checando token / estado físico).
-   - Marca `F1-B08` como `Occupied`.
-   - Toma o **último nó conhecido** de `V1` no trajeto, roda novo A\* para a melhor vaga livre (ex.: `F1-B11`) e adquire novo lease.
-   - Envia `RouteReassigned` via **SignalR** para o painel/simulador, mudando as setas de LED ao vivo.
+Under high-concurrency bursts (for example 25+ vehicles arriving simultaneously at entry gates), naive read-then-write reservation logic creates race conditions and double-booked bays.
 
----
+`ParkingAllocationService` + `RedisBayLeaseManager` (`LuaScripts`) eliminate split-brain allocations:
 
-## 4. Ingestão IoT via MQTT & Resiliência
+1. **Candidate Ranking**: Queries A\* cost from the vehicle's entry gate to compatible `BayStatus.Free` bays matching `VehicleType` (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
+2. **Atomic Lua Acquisition**: Executes `LuaScripts.AcquireBayLease` against `{prefix}:lease:bay:{bayId}` (`SET ... PX`) and `INCR` `{prefix}:fence:bay:{bayId}`, returning both acquisition status and a monotonic fencing token.
+3. **Congestion Lock-In**: Increments live traffic load on edges along the chosen `ParkingRoute` and updates upstream LED directional panels (`DirectionHint`).
+4. **Intrusion Detection & Self-Healing Reroute**: If a physical sensor reports occupancy on a bay in `BayStatus.Leased` state (an unbooked driver stole the spot), `ParkingAllocationService.ReconcilePhysicalOccupancyAsync`:
+   - Marks the bay `Occupied`, revokes its active lease via fencing token check (`LuaScripts.ReleaseBayLease`), and removes stale edge congestion.
+   - Locates the affected active session, computes a fresh A\* route starting from the vehicle's `CurrentNodeId`, atomically acquires a new bay lease with a higher fencing token, and emits `RouteReassigned` so both LED panels and live SignalR clients immediately redirect the driver.
 
-### Topologia de Tópicos
-- `parkmesh/sensors/{floor}/{bayId}/state` (QoS 1)
-  - Payload: `{ "bayId": "F1-B08", "occupied": true, "distanceCm": 42, "seq": 1094, "ts": "..." }`
-- `parkmesh/gates/{gateId}/admitted` (QoS 1) — **Ponto de integração com o `GateFlow` ou Simulador**
-  - Payload: `{ "eventId": "...", "gateId": "GATE-N1", "vehicleType": "EV", "plateHash": "...", "ts": "..." }`
-- `parkmesh/panels/{panelId}/direction` (QoS 0/1)
-  - Payload: `{ "panelId": "LED-N2", "arrow": "RIGHT", "floor": 1, "ts": "..." }`
+### 3.3 Telemetry Ingestion Pipeline & Anti-Flapping
 
-### Pipeline no `ParkMesh.TelemetryWorker`
-1. **Recepção `MQTTnet`:** Não abre transação ou lock no callback da rede; empurra o evento para um `BoundedChannel<SensorReading>` (`DropOldest` ou *backpressure* controlado por baia).
-2. **Anti-Flapping / Debounce Temporal:** Sensores ultrassônicos oscilam com pedestres ou reflexos. Uma mudança de estado só é promovida para evento de domínio quando confirmada por janela estável (ex.: 2 leituras consecutivas ou > 1.5s estável).
-3. **Idempotência por sequência (`seq`):** Mensagens fora de ordem ou duplicadas são descartadas.
+Physical bay sensors suffer from reflection noise, pedestrians crossing bays, and network micro-bursts.
+
+- **Bounded Backpressure (`TelemetryIngestionChannel`)**: Uses `System.Threading.Channels.Channel.CreateBounded<BaySensorReading>` with `BoundedChannelFullMode.DropOldest`, bounding memory usage and preserving freshest physical state while tracking `StaleDroppedCount` and `EnqueuedCount`.
+- **Anti-Flapping Debounce (`SensorReadingFilter`)**: Requires consecutive matching samples (`MinConsecutiveReadings`) spanning at least `StabilityWindowMs` before confirming a physical transition (`ConfirmedTransitionsCount`), preventing spurious reroute storms while counting suppressed noise (`DebouncedCount`).
+- **Confirmed Edge Forwarding (`SensorTelemetryProcessor`)**: Invokes downstream allocation reconciliation only on confirmed transitions rather than steady-state heartbeats.
+
+### 3.4 Real-Time Delta Streaming, Chaos Engineering & OpenTelemetry
+
+- **SignalR Hub (`/hubs/parking`)**:
+  - Client call: `GetParkingSnapshot()` returns full initial graph geometry, floor list, gates, active sessions, bay states, and metrics snapshot.
+  - Server-to-client delta events emitted by `SignalRParkingEventSink` and `MetricsBroadcastHostedService`:
+    - `RouteAssigned`
+    - `RouteReassigned` (including `displacedBayId`, `displacedSessionId`, and `newSession`)
+    - `BayStateChanged`
+    - `VehicleMoved`
+    - `LedPanelUpdated`
+    - `MetricsTick` (1-second heartbeat carrying P50/P95/P99 latencies, bay counts, allocations, contention retries, reroutes, and telemetry channel counters)
+- **OpenTelemetry Instrumentation (`EngineMetricsRecorder`)**:
+  - `Meter("ParkMesh.Engine")`: Histograms (`parkmesh.astar.duration.ms`, `parkmesh.redis.lease.duration.ms`) and Counters (`parkmesh.allocations.total`, `parkmesh.contention.retries.total`, `parkmesh.reroutes.total`).
+  - `ActivitySource("ParkMesh.Engine")`: Distributed spans around allocation (`AllocateAsync`) and physical occupancy reconciliation (`ReconcilePhysicalOccupancyAsync`).
+  - Sliding-window estimator (`SlidingLatencyWindow`, capacity `1024`) exposing real-time interpolated `P50`, `P95`, and `P99` latencies without GC-heavy heap churn.
 
 ---
 
-## 5. Simulação Visual em Tempo Real (SignalR)
+## 4. API & Protocol Surface
 
-Para cumprir o requisito de **demonstração visual viva** (não apenas endpoints):
-
-### Protocolo SignalR (`/hubs/parking`)
-- **Snapshot inicial** ao conectar (`GetParkingSnapshot`): planta dos andares (nós, arestas, baias, painéis LED) + sessões ativas.
-- **Deltas contínuos** (`VehicleMoved`, `BayStateChanged`, `RouteAssigned`, `RouteReassigned`, `LedPanelUpdated`, `MetricsTick`) evitando serializar o grafo inteiro a cada frame.
-
-### Capacidades do Simulador Visual (`web/` + `ParkMesh.Simulator`)
-- Visualização **2D multi-andar** com troca de pavimento (Térreo, G1, G2).
-- Carros animados percorrendo as arestas da rota calculada pelo A\*.
-- Vagas mudando de cor em tempo real (`Verde = Livre`, `Âmbar = Reservada com countdown 90s`, `Vermelho = Ocupada`, `Azul = EV`).
-- Setas luminosas dos **Painéis de LED** nos cruzamentos piscando conforme o direcionamento do próximo veículo.
-- Botões de **Caos / Teste ao vivo**:
-  - *"Injetar Intruso"*: ocupa fisicamente uma vaga que está reservada para ver o **re-roteamento acontecer na tela**.
-  - *"Rajada de Entrada"*: envia 50 veículos simultâneos pelas cancelas para testar contenção no Redis e pesos dinâmicos das vias.
-  - Painel de métricas ao vivo: P50/P95/P99 do A\*, mensagens MQTT/s, taxa de ocupação e re-roteamentos.
+| Surface | Endpoint / Topic | Purpose |
+| :--- | :--- | :--- |
+| Static UI | `GET /` | Serves the 2D multi-floor HTML5 Canvas simulator (`web/index.html`) |
+| Topology | `GET /api/parking/topology` | Returns graph nodes, edges, bays, and gates |
+| Live Snapshot | `GET /api/parking/snapshot` | Full state + graph + metrics bootstrap payload |
+| Telemetry Metrics | `GET /api/parking/metrics` | Current bay counts, active sessions, channel stats, and P50/P95/P99 |
+| Allocate Route | `POST /api/parking/allocations` | Allocates optimal conflict-free route + bay lease |
+| Vehicle Progress | `POST /api/parking/sessions/{sessionId}/progress` | Advances vehicle position along its assigned graph path |
+| Release Session | `DELETE /api/parking/sessions/{sessionId}` | Releases lease and clears edge congestion |
+| Physical Occupancy | `POST /api/parking/bays/{bayId}/occupancy` | Confirms physical occupied/vacated transition (triggers intrusion reroute if stolen) |
+| Sensor Reading | `POST /api/parking/telemetry/readings` | Enqueues a raw sensor reading into `TelemetryIngestionChannel` |
+| Chaos Intruder | `POST /api/parking/chaos/intruder` | Injects a physical intrusion into an active leased bay to demonstrate live rerouting |
+| Chaos Burst | `POST /api/parking/chaos/burst?count=25` | Fires concurrent allocation burst across entry gates (`1..60`) |
+| SignalR Hub | `WS /hubs/parking` | Bidirectional SignalR JSON protocol hub for real-time deltas |
+| MQTT Sensors | `parkmesh/sensors/{floor}/{bayId}/state` | Raw ultrasonic sensor payload stream |
+| MQTT Gates | `parkmesh/gates/{gateId}/admitted` | Gate vehicle admission events |
+| MQTT LED Panels | `parkmesh/panels/{panelId}/direction` | Retained LED directional guidance payload |
 
 ---
 
-## 6. Roadmap de Implementação (MVP Enxuto)
+## 5. Architecture Decision Records
 
-1. **Fase 1 — Grafo, A\* e Concorrência Redis (Core):**
-   - Criar `ParkMesh.sln` com `Domain`, `Application`, `Infrastructure`, `Api` e `UnitTests`.
-   - Modelar planta padrão de 3 andares (ex.: 120 vagas, 2 cancelas, rampas, vagas EV/PCD/SUV).
-   - Implementar A\* + script Lua no Redis + testes de concorrência com Testcontainers.
-2. **Fase 2 — MQTT, Simulador de Frota e Re-roteamento:**
-   - Subir Mosquitto/EMQX + Redis + PostgreSQL no `docker-compose.yml`.
-   - Implementar `TelemetryWorker` com `Channel<T>` + debounce e `ParkMesh.Simulator` simulando carros e invasões de vaga.
-3. **Fase 3 — SignalR + Dashboard Visual + Observabilidade:**
-   - Expor Hub SignalR com deltas e construir o canvas 2D interativo em `web/`.
-   - Instrumentar OpenTelemetry (latência do A\*, tempo de lease no Redis, vazão MQTT) e rodar benchmark de carga.
+Key technical trade-offs are documented in `docs/adr/`:
+
+1. [ADR 0001 — Modular Monolith with Dedicated Edge Workers](adr/0001-modular-monolith-over-microservices.md)
+2. [ADR 0002 — Atomic Redis Lua Leases with Monotonic Fencing Tokens](adr/0002-redis-lua-leases-with-fencing-tokens.md)
+3. [ADR 0003 — Multi-Floor A\* Pathfinding with Admissible Euclidean Heuristic](adr/0003-multi-floor-astar-with-admissible-heuristic.md)
+4. [ADR 0004 — Bounded Channel Backpressure and Anti-Flapping Debounce](adr/0004-bounded-channel-backpressure-and-anti-flapping.md)
+5. [ADR 0005 — SignalR Delta Protocol and Zero-Build HTML5 Canvas Simulator](adr/0005-signalr-delta-protocol-and-zero-build-canvas.md)
