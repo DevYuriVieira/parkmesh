@@ -28,5 +28,5 @@ jobs:
       - name: Run unit tests
         run: dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build --verbosity normal
 
-      - name: Run full integration suite (API, SignalR, Testcontainers Redis)
+      - name: Run full integration suite (API, OpenAPI, SignalR, Testcontainers Redis & Postgres)
         run: dotnet test tests/ParkMesh.IntegrationTests/ParkMesh.IntegrationTests.csproj -c Release --no-build --verbosity normal

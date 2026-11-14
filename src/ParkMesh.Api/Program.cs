@@ -55,6 +55,8 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
 });
 
+builder.Services.AddOpenApi();
+
 builder.Services
     .AddSignalR()
     .AddJsonProtocol(options =>
@@ -102,6 +104,7 @@ var app = builder.Build();
 
 app.UseRateLimiter();
 app.UseOpenTelemetryPrometheusScrapingEndpoint();
+app.MapOpenApi();
 
 var webRoot = ResolveWebDirectory(app.Environment.ContentRootPath);
 if (webRoot is not null)

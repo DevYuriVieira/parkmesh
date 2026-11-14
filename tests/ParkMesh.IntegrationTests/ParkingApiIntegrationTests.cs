@@ -384,6 +384,23 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         Assert.Equal(BayStatus.Free, restored!.NewStatus);
     }
 
+    [Fact]
+    public async Task OpenApiEndpoint_ServesValidOpenApiDocumentWithParkingRoutes()
+    {
+        var response = await _client.GetAsync("/openapi/v1.json");
+        Assert.Equal(HttpStatusCode.OK, response.StatusCode);
+
+        using var doc = await response.Content.ReadFromJsonAsync<JsonDocument>();
+        Assert.NotNull(doc);
+        Assert.True(doc!.RootElement.TryGetProperty("openapi", out var version));
+        Assert.StartsWith("3.", version.GetString());
+
+        var paths = doc.RootElement.GetProperty("paths");
+        Assert.True(paths.TryGetProperty("/api/parking/allocations", out _));
+        Assert.True(paths.TryGetProperty("/api/parking/bays/{bayId}/maintenance", out _));
+        Assert.True(paths.TryGetProperty("/api/parking/audit", out _));
+    }
+
     private static bool IsHubTarget(JsonDocument doc, string targetName) =>
         doc.RootElement.TryGetProperty("type", out var t)
         && t.GetInt32() == 1
