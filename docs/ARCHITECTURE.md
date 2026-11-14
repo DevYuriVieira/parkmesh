@@ -34,7 +34,7 @@ flowchart LR
 
 ### 3.1 Multi-Floor Weighted Directed Graph & A\* Pathfinding
 
-The parking facility is modeled in memory as a weighted directed graph $G = (V, E)$ via `StandardTopologyFactory.CreateStandardMultiFloorGarage()` (`3` floors: `-1`, `0`, `1`; `120` parking bays):
+The parking facility is modeled in memory as a weighted directed graph $G = (V, E)$ via `StandardTopologyFactory.CreateStandardGarage()` (`3` floors: `0`, `1`, `2`; `120` parking bays):
 
 - **Vertices ($V$)**: Entry gates (`NodeType.Gate`), lane intersections (`NodeType.Intersection`), inter-floor helical ramps (`NodeType.Ramp`), and individual bays (`NodeType.Bay`).
 - **Edges ($E$)**: Directed `GraphEdge` segments carrying base distance/weight (`BaseWeight`), length, lane capacity (`Capacity`), optional ramp metadata (`IsRamp`), and dynamic congestion cost adjustments via `IEdgeCongestionTracker`.
@@ -67,7 +67,7 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
   - Client call: `GetParkingSnapshot()` returns full initial graph geometry, floor list, gates, active sessions, bay states, and metrics snapshot.
   - Server-to-client delta events emitted by `SignalRParkingEventSink` and `MetricsBroadcastHostedService`:
     - `RouteAssigned`
-    - `RouteReassigned` (including `PreviousBayId` and `Reason`)
+    - `RouteReassigned` (including `displacedBayId`, `displacedSessionId`, and `newSession`)
     - `BayStateChanged`
     - `VehicleMoved`
     - `LedPanelUpdated`
