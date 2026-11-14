@@ -99,6 +99,39 @@ body {
   font-size: 0.72rem;
 }
 
+.topbar-controls {
+  display: flex;
+  align-items: center;
+  gap: 0.9rem;
+  flex-wrap: wrap;
+}
+
+.tenant-control {
+  display: flex;
+  align-items: center;
+  gap: 0.4rem;
+  font-size: 0.78rem;
+  color: var(--muted);
+}
+
+.tenant-control select,
+.tenant-control input {
+  background: #0f1726;
+  color: var(--text);
+  border: 1px solid var(--panel-border);
+  border-radius: 7px;
+  padding: 0.3rem 0.55rem;
+  font-size: 0.78rem;
+}
+
+.tenant-control input {
+  width: 120px;
+}
+
+.hidden {
+  display: none !important;
+}
+
 .connection-status {
   display: flex;
   align-items: center;

@@ -1,3 +1,6 @@
+using Microsoft.Extensions.Options;
+using ParkMesh.Api.Security;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Application.Audit;
 
@@ -8,17 +11,20 @@ public sealed class GarageStateHydrationHostedService : BackgroundService
     private readonly IParkingAuditStore _auditStore;
     private readonly IParkingAllocationService _allocationService;
     private readonly IStateHydrationTracker _tracker;
+    private readonly IOptionsMonitor<SecurityOptions> _securityOptions;
     private readonly ILogger<GarageStateHydrationHostedService> _logger;
 
     public GarageStateHydrationHostedService(
         IParkingAuditStore auditStore,
         IParkingAllocationService allocationService,
         IStateHydrationTracker tracker,
+        IOptionsMonitor<SecurityOptions> securityOptions,
         ILogger<GarageStateHydrationHostedService> logger)
     {
         _auditStore = auditStore;
         _allocationService = allocationService;
         _tracker = tracker;
+        _securityOptions = securityOptions;
         _logger = logger;
     }
 
@@ -29,7 +35,13 @@ public sealed class GarageStateHydrationHostedService : BackgroundService
             try
             {
                 await _auditStore.InitializeAsync(stoppingToken);
-                var restored = await _allocationService.RehydrateStateAsync(stoppingToken);
+
+                var configuredTenants = _securityOptions.CurrentValue.AllowedTenants;
+                IEnumerable<string> tenantsToHydrate = configuredTenants is { Length: > 0 }
+                    ? [TenantDefaults.DefaultTenantId, ..configuredTenants]
+                    : [TenantDefaults.DefaultTenantId];
+
+                var restored = await _allocationService.RehydrateStateAsync(tenantsToHydrate, stoppingToken);
                 _tracker.MarkHydrated(restored);
                 return;
             }

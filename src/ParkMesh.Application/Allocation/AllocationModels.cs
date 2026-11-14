@@ -1,3 +1,4 @@
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Domain;
 
 namespace ParkMesh.Application.Allocation;
@@ -16,7 +17,8 @@ public sealed record ActiveVehicleSession(
     ParkingRoute Route,
     string LastKnownNodeId,
     DateTimeOffset AllocatedAtUtc,
-    DateTimeOffset ExpiresAtUtc);
+    DateTimeOffset ExpiresAtUtc,
+    string TenantId = TenantDefaults.DefaultTenantId);
 
 public sealed record AllocateSpotResult(
     bool Succeeded,

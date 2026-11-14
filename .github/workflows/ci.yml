@@ -25,6 +25,9 @@ jobs:
       - name: Build solution
         run: dotnet build ParkMesh.sln -c Release --no-restore
 
+      - name: Validate Docker Compose configuration
+        run: docker compose -f infra/docker-compose.yml --profile full config --quiet
+
       - name: Run unit tests
         run: dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build --verbosity normal
 
