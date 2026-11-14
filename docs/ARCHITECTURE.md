@@ -38,7 +38,7 @@ The parking facility is modeled in memory as a weighted directed graph $G = (V, 
 
 - **Vertices ($V$)**: Entry gates (`NodeType.Gate`), lane intersections (`NodeType.Intersection`), inter-floor helical ramps (`NodeType.Ramp`), and individual bays (`NodeType.Bay`).
 - **Edges ($E$)**: Directed `GraphEdge` segments carrying base distance (`BaseDistance`), ramp indicator (`IsRamp`), ramp penalty (`RampPenalty`), `EffectiveBaseCost`, and dynamic congestion cost adjustments via `IEdgeCongestionTracker`.
-- **A\* Search (`AStarPathfinder`)**: Uses a `PriorityQueue<string, double>` with an admissible Euclidean heuristic incorporating vertical floor elevation cost, ensuring optimal shortest-cost routes while dynamically steering around congested aisles.
+- **A\* & Multi-Target Search (`AStarPathfinder`)**: Compiles dense integer indices per `ParkingGraph` (`ConditionalWeakTable`), rents `ArrayPool<T>` scratch buffers, and runs a single-pass multi-target Dijkstra sweep with sliding k-th best early-exit cutoff for candidate bay discovery alongside admissible single-target A\* routing.
 
 ### 3.2 Atomic Bay Allocation, Fencing Tokens & Live Rerouting
 
@@ -81,7 +81,7 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 
 - **Asynchronous Audit Outbox (`AuditChannelSink`, `PostgresParkingAuditStore`, `ParkingAuditHostedService`)**: Allocation, release, expiration, occupancy, and intrusion-reroute events enqueue non-blockingly into a bounded channel (`DropOldest`, capacity `8192`) and flush in batches (`NpgsqlBatch`) to PostgreSQL `parking_audit_events` (or `InMemoryParkingAuditStore` when PostgreSQL is unconfigured).
 - **Proactive Lease Sweeper (`LeaseExpirationSweeperHostedService`)**: Polls `PurgeExpiredSessionsAsync` every 2 seconds using `TimeProvider`, reclaiming abandoned leases, clearing edge congestion, and broadcasting `BayStateChanged` (`Free`) to SignalR clients.
-- **Edge Security & Probes**: Fixed-time `X-Api-Key` verification (`ApiKeyEndpointFilter`) on edge mutation routes when configured, fixed-window rate limiting on chaos endpoints (`429 Too Many Requests`), and dependency-aware `/health/ready` (`Redis` + `PostgreSQL`) alongside `/health/live`.
+- **Edge Security, Startup Hydration & Probes**: Fixed-time `X-Api-Key` verification (`ApiKeyEndpointFilter`) on edge mutation routes when configured, fixed-window rate limiting on chaos endpoints (`429 Too Many Requests`), dependency-and-hydration-aware `/health/ready` (`Redis` + `PostgreSQL` + `GarageStateHydrationHostedService`), `/openapi/v1.json`, and `/health/live`.
 
 ---
 
@@ -97,12 +97,14 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 | Vehicle Progress | `POST /api/parking/sessions/{sessionId}/progress` | Advances vehicle position along its assigned graph path |
 | Release Session | `DELETE /api/parking/sessions/{sessionId}` | Releases lease and clears edge congestion |
 | Physical Occupancy | `POST /api/parking/bays/{bayId}/occupancy` | Confirms physical occupied/vacated transition (triggers intrusion reroute if stolen) |
+| Bay Maintenance | `PATCH /api/parking/bays/{bayId}/maintenance` | Marks a bay `OutOfService` (rerouting any leased car) or restores it `Free` |
 | Sensor Reading | `POST /api/parking/telemetry/readings` | Enqueues a raw sensor reading into `TelemetryIngestionChannel` |
 | Chaos Intruder | `POST /api/parking/chaos/intruder` | Injects a physical intrusion into an active leased bay to demonstrate live rerouting |
 | Chaos Burst | `POST /api/parking/chaos/burst?count=25` | Fires concurrent allocation burst across entry gates (`1..60`) |
 | Audit Log | `GET /api/parking/audit?limit=50` | Recent persisted parking lifecycle audit events |
 | Health (Live) | `GET /health/live` | Process liveness probe |
-| Health (Ready) | `GET /health/ready` | Dependency readiness probe (`Redis` + `PostgreSQL` or in-memory fallbacks) |
+| Health (Ready) | `GET /health/ready` | Dependency & startup state-hydration readiness probe (`Redis` + `PostgreSQL` + `IsHydrated`) |
+| OpenAPI Spec | `GET /openapi/v1.json` | Machine-readable OpenAPI 3 specification generated via `.NET 10` OpenAPI |
 | Prometheus | `GET /metrics` | OpenTelemetry Prometheus scraping endpoint |
 | SignalR Hub | `WS /hubs/parking` | Bidirectional SignalR JSON protocol hub for real-time deltas |
 | MQTT Sensors | `parkmesh/sensors/{floor}/{bayId}/state` | Raw ultrasonic sensor payload stream |
@@ -121,3 +123,4 @@ Key technical trade-offs are documented in `docs/adr/`:
 4. [ADR 0004 — Bounded Channel Backpressure and Anti-Flapping Debounce](adr/0004-bounded-channel-backpressure-and-anti-flapping.md)
 5. [ADR 0005 — SignalR Delta Protocol and Zero-Build HTML5 Canvas Simulator](adr/0005-signalr-delta-protocol-and-zero-build-canvas.md)
 6. [ADR 0006 — Asynchronous Audit Outbox, Proactive Lease Reconciliation, and Edge Hardening](adr/0006-async-audit-outbox-and-lease-reconciliation.md)
+7. [ADR 0007 — Single-Pass Indexed Multi-Target Routing, Startup State Hydration, and Bay Maintenance Lifecycle](adr/0007-indexed-multi-target-routing-and-state-hydration.md)
