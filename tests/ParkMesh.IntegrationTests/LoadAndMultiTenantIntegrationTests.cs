@@ -146,11 +146,17 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
         var js = await client.GetStringAsync("/app.js");
         Assert.Contains("X-Tenant-Id", js);
 
-        await Task.Delay(150);
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (Volatile.Read(ref signalrInvocations) < 18 && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(25);
+        }
         cts.Cancel();
         try { await receiveTask; } catch { }
 
-        Assert.True(Volatile.Read(ref signalrInvocations) >= 18);
+        Assert.True(
+            Volatile.Read(ref signalrInvocations) >= 18,
+            $"Expected >= 18 SignalR invocation frames, received {Volatile.Read(ref signalrInvocations)}.");
     }
 
     private static Task SendFrameAsync(WebSocket ws, string json, CancellationToken ct) =>

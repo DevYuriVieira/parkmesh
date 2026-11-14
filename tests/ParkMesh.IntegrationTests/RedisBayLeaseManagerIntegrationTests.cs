@@ -112,6 +112,7 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
             NullLogger<RedisBayLeaseManager>.Instance,
             tenantContext);
 
+        // 1. Both tenants can acquire the same bay ID in isolated Redis namespaces without collision
         LeaseAcquireResult leaseAlpha;
         using (tenantContext.BeginScope("tenant-alpha"))
         {
@@ -129,18 +130,39 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
         Assert.Equal(1, leaseAlpha.FencingToken);
         Assert.Equal(1, leaseBeta.FencingToken);
 
+        // 2. Tenant-scoped release touches only the calling tenant's Redis key
         using (tenantContext.BeginScope("tenant-beta"))
         {
-            var crossRelease = await manager.TryReleaseLeaseAsync("F0-B06", leaseAlpha.FencingToken);
+            Assert.False(await manager.TryReleaseLeaseAsync("F0-B05", 99));
+            Assert.True(await manager.TryReleaseLeaseAsync("F0-B05", leaseBeta.FencingToken));
+            Assert.Null(await manager.GetActiveLeaseHolderAsync("F0-B05"));
+        }
+
+        using (tenantContext.BeginScope("tenant-alpha"))
+        {
+            Assert.Equal("SHARED-CAR", await manager.GetActiveLeaseHolderAsync("F0-B05"));
+        }
+
+        LeaseAcquireResult leaseAlphaSecondBay;
+        using (tenantContext.BeginScope("tenant-alpha"))
+        {
+            leaseAlphaSecondBay = await manager.TryAcquireLeaseAsync("F0-B06", "CAR-ALPHA-2", TimeSpan.FromSeconds(45));
+        }
+        Assert.True(leaseAlphaSecondBay.Acquired);
+
+        using (tenantContext.BeginScope("tenant-beta"))
+        {
+            var crossRelease = await manager.TryReleaseLeaseAsync("F0-B06", leaseAlphaSecondBay.FencingToken);
             Assert.False(crossRelease);
         }
 
-        LeaseAcquireResult leaseBetaSecondBay;
+        // 3. Multi-tenant rehydration restores active leases for distinct physical bays onto one garage service
+        LeaseAcquireResult leaseBetaOtherBay;
         using (tenantContext.BeginScope("tenant-beta"))
         {
-            leaseBetaSecondBay = await manager.TryAcquireLeaseAsync("F1-B08", "CAR-BETA", TimeSpan.FromSeconds(45));
+            leaseBetaOtherBay = await manager.TryAcquireLeaseAsync("F1-B08", "CAR-BETA", TimeSpan.FromSeconds(45));
         }
-        Assert.True(leaseBetaSecondBay.Acquired);
+        Assert.True(leaseBetaOtherBay.Acquired);
 
         var freshGraph = StandardTopologyFactory.CreateStandardGarage();
         var service = new ParkingAllocationService(
@@ -152,9 +174,10 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
             tenantContext: tenantContext);
 
         var restored = await service.RehydrateStateAsync(["default", "tenant-alpha", "tenant-beta"]);
-        Assert.True(restored >= 2);
-        Assert.Single(service.GetActiveSessions("tenant-alpha"));
-        Assert.Equal(2, service.GetActiveSessions("tenant-beta").Count);
+        Assert.Equal(3, restored);
+        Assert.Equal(2, service.GetActiveSessions("tenant-alpha").Count);
+        Assert.Single(service.GetActiveSessions("tenant-beta"));
+        Assert.Empty(service.GetActiveSessions("default"));
     }
 
     private RedisBayLeaseManager CreateManager(string prefix) =>
