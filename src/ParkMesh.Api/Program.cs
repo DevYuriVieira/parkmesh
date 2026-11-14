@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.FileProviders;
@@ -102,6 +103,27 @@ builder.Services
 
 var app = builder.Build();
 
+app.UseMiddleware<SecurityHeadersMiddleware>();
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+        var (statusCode, message) = exception switch
+        {
+            BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge } =>
+                (StatusCodes.Status413PayloadTooLarge, "Request payload exceeds the configured size limit."),
+            BadHttpRequestException badReq =>
+                (badReq.StatusCode, "Malformed HTTP request payload."),
+            _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
+        };
+
+        context.Response.StatusCode = statusCode;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new { error = message });
+    });
+});
+app.UseMiddleware<TenantResolutionMiddleware>();
 app.UseRateLimiter();
 app.UseOpenTelemetryPrometheusScrapingEndpoint();
 app.MapOpenApi();
@@ -184,16 +206,19 @@ app.MapGet("/api/parking/audit", async (
     [FromQuery] int? limit,
     IParkingAuditStore auditStore,
     IParkingAuditSink auditSink,
+    ITenantContext tenantContext,
     CancellationToken ct) =>
 {
-    var items = await auditStore.GetRecentAsync(limit ?? 50, ct);
+    var tenantId = tenantContext.CurrentTenantId;
+    var items = await auditStore.GetRecentAsync(tenantId, limit ?? 50, ct);
     return Results.Ok(new
     {
+        tenantId,
         count = items.Count,
         droppedCount = auditSink.DroppedCount,
         events = items
     });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/bays", (
     IParkingAllocationService allocationService,
@@ -258,7 +283,7 @@ app.MapPost("/api/parking/allocations", async (
             result.Session,
             result.ComputationTimeMs
         });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapDelete("/api/parking/allocations/{bayId}", async (
     string bayId,
@@ -268,7 +293,7 @@ app.MapDelete("/api/parking/allocations/{bayId}", async (
 {
     var released = await allocationService.ReleaseLeaseAsync(bayId, fencingToken, ct);
     return released ? Results.NoContent() : Results.Conflict(new { error = "Invalid or expired fencing token." });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapPost("/api/parking/bays/{bayId}/occupancy", async (
     string bayId,
@@ -307,7 +332,7 @@ app.MapPatch("/api/parking/bays/{bayId}/maintenance", async (
     {
         return Results.NotFound(new { error = $"Bay '{bayId}' not found." });
     }
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/sessions", (IParkingAllocationService allocationService) =>
     Results.Ok(allocationService.GetActiveSessions()));
@@ -379,8 +404,8 @@ var chaosBurstEndpoint = app.MapPost("/api/parking/chaos/burst", async (
     });
 });
 
-chaosIntruderEndpoint.RequireRateLimiting("chaos");
-chaosBurstEndpoint.RequireRateLimiting("chaos");
+chaosIntruderEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
+chaosBurstEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapHub<ParkingHub>("/hubs/parking");
 
