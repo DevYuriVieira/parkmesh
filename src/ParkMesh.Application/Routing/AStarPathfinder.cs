@@ -11,6 +11,36 @@ public sealed class AStarPathfinder : IPathfinder
 
     private static readonly ConditionalWeakTable<ParkingGraph, CompiledTopology> TopologyCache = new();
 
+    [ThreadStatic]
+    private static PriorityQueue<int, double>? t_openSet;
+
+    [ThreadStatic]
+    private static PriorityQueue<double, double>? t_topScores;
+
+    [ThreadStatic]
+    private static List<CandidateMatch>? t_candidates;
+
+    private static PriorityQueue<int, double> GetClearedOpenSet()
+    {
+        var openSet = t_openSet ??= new PriorityQueue<int, double>();
+        openSet.Clear();
+        return openSet;
+    }
+
+    private static PriorityQueue<double, double> GetClearedTopScores()
+    {
+        var topScores = t_topScores ??= new PriorityQueue<double, double>();
+        topScores.Clear();
+        return topScores;
+    }
+
+    private static List<CandidateMatch> GetClearedCandidates(int initialCapacity)
+    {
+        var candidates = t_candidates ??= new List<CandidateMatch>(initialCapacity);
+        candidates.Clear();
+        return candidates;
+    }
+
     public ParkingRoute? FindShortestPath(
         ParkingGraph graph,
         string startNodeId,
@@ -60,7 +90,7 @@ public sealed class AStarPathfinder : IPathfinder
             Array.Clear(prevCost, 0, nodeCount);
 
             gScore[startIdx] = 0.0;
-            var openSet = new PriorityQueue<int, double>();
+            var openSet = GetClearedOpenSet();
             openSet.Enqueue(startIdx, ComputeHeuristic(startNode, targetNode));
 
             while (openSet.TryDequeue(out var currentIdx, out _))
@@ -113,6 +143,9 @@ public sealed class AStarPathfinder : IPathfinder
         }
         finally
         {
+            t_openSet?.Clear();
+            t_topScores?.Clear();
+            t_candidates?.Clear();
             ArrayPool<double>.Shared.Return(gScore);
             ArrayPool<bool>.Shared.Return(closed);
             ArrayPool<int>.Shared.Return(prevNode);
@@ -154,11 +187,11 @@ public sealed class AStarPathfinder : IPathfinder
             Array.Clear(prevCost, 0, nodeCount);
 
             gScore[startIdx] = 0.0;
-            var openSet = new PriorityQueue<int, double>();
+            var openSet = GetClearedOpenSet();
             openSet.Enqueue(startIdx, 0.0);
 
-            var candidates = new List<CandidateMatch>(Math.Min(maxCandidates * 2, 64));
-            var topScores = new PriorityQueue<double, double>();
+            var candidates = GetClearedCandidates(Math.Min(maxCandidates * 2, 64));
+            var topScores = GetClearedTopScores();
             var kthWorstScore = double.PositiveInfinity;
 
             while (openSet.TryDequeue(out var currentIdx, out var currentDist))
@@ -240,6 +273,9 @@ public sealed class AStarPathfinder : IPathfinder
         }
         finally
         {
+            t_openSet?.Clear();
+            t_topScores?.Clear();
+            t_candidates?.Clear();
             ArrayPool<double>.Shared.Return(gScore);
             ArrayPool<bool>.Shared.Return(closed);
             ArrayPool<int>.Shared.Return(prevNode);

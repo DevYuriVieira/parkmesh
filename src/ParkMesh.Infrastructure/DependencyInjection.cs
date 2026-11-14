@@ -69,8 +69,9 @@ public static class DependencyInjection
         var postgresConnectionString = configuration.GetConnectionString("Postgres");
         if (!string.IsNullOrWhiteSpace(postgresConnectionString))
         {
+            var appRole = configuration["Postgres:AppRole"];
             services.AddSingleton<IParkingAuditStore>(_ =>
-                new PostgresParkingAuditStore(postgresConnectionString));
+                new PostgresParkingAuditStore(postgresConnectionString, appRole));
         }
         else
         {

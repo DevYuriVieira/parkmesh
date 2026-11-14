@@ -5,8 +5,8 @@ Smart parking routing and bay allocation engine written in .NET 10 (C# 14). It m
 ## Overview
 
 - `ParkMesh.Domain`: 3-floor (`0..2`), 120-bay graph model with directional lanes, helical ramps, LED directional panels, and vehicle type constraints (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
-- `ParkMesh.Application`: Cached dense-index topology (`ConditionalWeakTable`), `ArrayPool<T>` single-pass multi-target search with early-exit cutoff, multi-round contention replanning under parallel arrivals, intrusion rerouting, maintenance toggles (`OutOfService`), bounded telemetry debounce (`SensorReadingFilter`), and async tenant context (`ITenantContext`).
-- `ParkMesh.Infrastructure`: Atomic Redis Lua bay leases (`LuaScripts.AcquireBayLease`) with automatic in-memory fallback when `ConnectionStrings:Redis` is unset, MQTTnet ingestion worker, and bounded channel audit outbox (`AuditChannelSink`) flushing batches to PostgreSQL (`PostgresParkingAuditStore`) with `ENABLE`/`FORCE ROW LEVEL SECURITY` fail-closed policies (`set_config('app.current_tenant', ..., true)`) or `InMemoryParkingAuditStore` locally.
+- `ParkMesh.Application`: Cached dense-index topology (`ConditionalWeakTable`), `ArrayPool<T>` and `[ThreadStatic]` scratch-pooled single-pass multi-target search with early-exit cutoff, idempotent session retry handling (`409 Conflict` on mismatched parameters), multi-round contention replanning under parallel arrivals, intrusion rerouting, maintenance toggles (`OutOfService`), bounded telemetry debounce (`SensorReadingFilter`), and async tenant context (`ITenantContext`).
+- `ParkMesh.Infrastructure`: Atomic Redis Lua bay leases (`LuaScripts.AcquireBayLease`) with automatic in-memory fallback when `ConnectionStrings:Redis` is unset, MQTTnet ingestion worker, and bounded channel audit outbox (`AuditChannelSink`) with full shutdown batch draining into PostgreSQL (`PostgresParkingAuditStore`) enforcing `ENABLE`/`FORCE ROW LEVEL SECURITY` (`set_config('app.current_tenant', ..., true)` and optional `Postgres:AppRole` via `SET LOCAL ROLE`) or `InMemoryParkingAuditStore` locally.
 - `ParkMesh.Api`: Minimal APIs, `/hubs/parking` SignalR stream, Prometheus `/metrics`, OpenAPI spec (`/openapi/v1.json`), startup state hydration gating `/health/ready`, SHA-256 constant-time `X-Api-Key` verification, `X-Tenant-Id` validation and optional allowlisting (`Security:AllowedTenants`), security response headers, chaos rate limiting, lease expiration sweeper, and static dashboard hosting (`web/`).
 - `ParkMesh.TelemetryWorker` & `ParkMesh.Simulator`: Standalone MQTT simulator (noisy sensors, intrusions, fleet arrivals) and worker forwarding confirmed physical state transitions to the API.
 
@@ -95,11 +95,11 @@ Microbenchmark numbers (`BenchmarkDotNet v0.15.8`, `.NET 10.0.11`, in-process sh
 
 | Benchmark | Phase 4 Baseline | Current Mean | Current Allocated |
 | :--- | ---: | ---: | ---: |
-| `AStar_Find15Candidates_Standard` | ~689.2 us (~847 KB) | `5.43 us` | `13,880 B` |
-| `AStar_Find15Candidates_EV` | ~320.6 us (~409 KB) | `13.48 us` | `19,496 B` |
-| `AllocateAndRelease_InMemory` | ~636.1 us (~892 KB) | `10.14 us` | `15,440 B` |
-| `TelemetryFilter_EvaluateReading` | ~58.7 ns (72 B) | `59.21 ns` | `72 B` |
-| `SlidingWindow_Compute1024Percentiles` | ~9.21 us (~8.1 KB) | `7.20 us` | `8,264 B` |
+| `AStar_Find15Candidates_Standard` | ~689.2 us (~847 KB) | `5.90 us` | `11,728 B` |
+| `AStar_Find15Candidates_EV` | ~320.6 us (~409 KB) | `8.48 us` | `16,808 B` |
+| `AllocateAndRelease_InMemory` | ~636.1 us (~892 KB) | `8.43 us` | `13,568 B` |
+| `TelemetryFilter_EvaluateReading` | ~58.7 ns (72 B) | `64.53 ns` | `72 B` |
+| `SlidingWindow_Compute1024Percentiles` | ~9.21 us (~8.1 KB) | `6.74 us` | `8,264 B` |
 
 ## Documentation
 

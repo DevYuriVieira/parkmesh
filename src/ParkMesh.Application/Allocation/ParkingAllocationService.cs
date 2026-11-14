@@ -105,6 +105,43 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
         const int initialCandidateBatchSize = 15;
         var sw = Stopwatch.StartNew();
+
+        // Idempotency & conflict guard: if the caller retries the exact same session
+        // (same gate and vehicle type) while its lease is still active, return the
+        // existing allocation instead of grabbing a second bay. If parameters differ,
+        // reject with a conflict so one session cannot hold two bays.
+        if (_sessions.TryGetValue(request.VehicleSessionId, out var existing) &&
+            _graph.TryGetBay(existing.AssignedBayId, out var existingBay))
+        {
+            var now = _timeProvider.GetUtcNow();
+            bool stillActive;
+            lock (_stateLock)
+            {
+                stillActive = existingBay.Status == BayStatus.Leased
+                    && string.Equals(existingBay.CurrentSessionId, request.VehicleSessionId, StringComparison.OrdinalIgnoreCase)
+                    && (existingBay.LeaseExpiresAtUtc is null || existingBay.LeaseExpiresAtUtc > now);
+            }
+
+            if (stillActive)
+            {
+                var existingStartNodeId = existing.Route.NodeIds.Count > 0
+                    ? existing.Route.NodeIds[0]
+                    : existing.LastKnownNodeId;
+
+                if (string.Equals(existingStartNodeId, request.StartNodeId, StringComparison.OrdinalIgnoreCase) &&
+                    existing.VehicleType == request.VehicleType)
+                {
+                    activity?.SetTag("parkmesh.idempotent_hit", true);
+                    activity?.SetTag("parkmesh.allocated_bay", existing.AssignedBayId);
+                    return new AllocateSpotResult(true, existing, ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
+                }
+
+                return new AllocateSpotResult(
+                    false,
+                    FailureReason: $"Session '{request.VehicleSessionId}' already has an active lease on bay '{existing.AssignedBayId}'.",
+                    ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
+            }
+        }
         var ttl = request.LeaseTtl ?? DefaultLeaseTtl;
         HashSet<string>? exhaustedBays = null;
 

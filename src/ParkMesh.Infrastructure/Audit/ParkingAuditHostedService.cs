@@ -55,13 +55,18 @@ public sealed class ParkingAuditHostedService : BackgroundService
         }
         finally
         {
-            while (batch.Count < MaxBatchSize && _sink.TryRead(out var remaining))
+            while (true)
             {
-                batch.Add(remaining);
-            }
+                while (batch.Count < MaxBatchSize && _sink.TryRead(out var remaining))
+                {
+                    batch.Add(remaining);
+                }
 
-            if (batch.Count > 0)
-            {
+                if (batch.Count == 0)
+                {
+                    break;
+                }
+
                 await FlushAsync(batch, CancellationToken.None);
             }
         }
