@@ -3,6 +3,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Domain;
 
@@ -13,6 +14,7 @@ public sealed class ParkMeshApiOptions
     public const string SectionName = "ParkMeshApi";
     public string BaseUrl { get; set; } = "http://localhost:5000";
     public string ApiKey { get; set; } = string.Empty;
+    public string TenantId { get; set; } = string.Empty;
 }
 
 public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDisposable
@@ -40,6 +42,16 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
         if (!string.IsNullOrWhiteSpace(apiOptions.Value.ApiKey))
         {
             _httpClient.DefaultRequestHeaders.Add("X-Api-Key", apiOptions.Value.ApiKey);
+        }
+
+        if (!string.IsNullOrWhiteSpace(apiOptions.Value.TenantId))
+        {
+            if (!TenantIdValidator.IsValid(apiOptions.Value.TenantId))
+            {
+                throw new ArgumentException($"Invalid configured ParkMeshApi:TenantId '{apiOptions.Value.TenantId}'.");
+            }
+
+            _httpClient.DefaultRequestHeaders.Add(TenantDefaults.HeaderName, apiOptions.Value.TenantId);
         }
     }
 

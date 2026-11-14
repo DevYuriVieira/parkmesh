@@ -185,6 +185,55 @@ public sealed class DomainAndAllocationEdgeTests
         Assert.True(rejectingLeaseManager.Attempts > 15);
     }
 
+    [Fact]
+    public async Task AllocateAsync_SameSessionAndParameters_ReturnsExistingAllocationIdempotently()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            new InMemoryBayLeaseManager(),
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance);
+
+        var first = await service.AllocateAsync(
+            new AllocateSpotRequest("GATE-N1", "RETRY-CAR-1", VehicleType.Standard));
+        Assert.True(first.Succeeded);
+        Assert.NotNull(first.Session);
+
+        var second = await service.AllocateAsync(
+            new AllocateSpotRequest("GATE-N1", "RETRY-CAR-1", VehicleType.Standard));
+        Assert.True(second.Succeeded);
+        Assert.NotNull(second.Session);
+        Assert.Equal(first.Session.AssignedBayId, second.Session.AssignedBayId);
+        Assert.Equal(first.Session.FencingToken, second.Session.FencingToken);
+        Assert.Single(service.GetActiveSessions());
+    }
+
+    [Fact]
+    public async Task AllocateAsync_SameSessionWithDifferentParameters_ReturnsConflictFailure()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            new InMemoryBayLeaseManager(),
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance);
+
+        var first = await service.AllocateAsync(
+            new AllocateSpotRequest("GATE-N1", "CONFLICT-CAR-1", VehicleType.Standard));
+        Assert.True(first.Succeeded);
+        Assert.NotNull(first.Session);
+
+        var conflict = await service.AllocateAsync(
+            new AllocateSpotRequest("GATE-S1", "CONFLICT-CAR-1", VehicleType.EV));
+        Assert.False(conflict.Succeeded);
+        Assert.Contains("already has an active lease", conflict.FailureReason);
+        Assert.Contains(first.Session.AssignedBayId, conflict.FailureReason);
+        Assert.Single(service.GetActiveSessions());
+    }
+
     private sealed class BarrierAsyncLeaseManager(int expectedInitialArrivals) : IBayLeaseManager
     {
         private readonly InMemoryBayLeaseManager _inner = new();

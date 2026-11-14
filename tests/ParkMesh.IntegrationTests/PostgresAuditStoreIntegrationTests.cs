@@ -174,4 +174,31 @@ public sealed class PostgresAuditStoreIntegrationTests : IAsyncLifetime
             await tx.RollbackAsync();
         }
     }
+
+    [Fact]
+    public async Task PostgresAuditStore_WithDatabaseRole_EnforcesRowLevelSecurityOverAdminPool()
+    {
+        await using var adminStore = new PostgresParkingAuditStore(_postgresContainer.GetConnectionString());
+        await adminStore.InitializeAsync();
+        await ProvisionRestrictedRoleAsync();
+
+        await using var roleScopedStore = new PostgresParkingAuditStore(
+            _postgresContainer.GetConnectionString(),
+            databaseRole: "parkmesh_app");
+
+        var now = DateTimeOffset.UtcNow;
+        await roleScopedStore.RecordBatchAsync(
+        [
+            new ParkingAuditEvent(now, AuditEventType.BayAllocated, "F0-B10", "ROLE-A", 1, VehicleType.Standard, "GATE-N1", "a", TenantId: "tenant-role-a"),
+            new ParkingAuditEvent(now.AddSeconds(1), AuditEventType.BayAllocated, "F0-B11", "ROLE-B", 1, VehicleType.EV, "GATE-S1", "b", TenantId: "tenant-role-b")
+        ]);
+
+        var eventsA = await roleScopedStore.GetRecentAsync("tenant-role-a", 20);
+        var eventsB = await roleScopedStore.GetRecentAsync("tenant-role-b", 20);
+
+        Assert.Single(eventsA);
+        Assert.Equal("ROLE-A", eventsA[0].SessionId);
+        Assert.Single(eventsB);
+        Assert.Equal("ROLE-B", eventsB[0].SessionId);
+    }
 }

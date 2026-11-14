@@ -22,6 +22,7 @@ services:
       - "5432:5432"
     volumes:
       - parkmesh_pgdata:/var/lib/postgresql/data
+      - ./postgres/init-rls.sql:/docker-entrypoint-initdb.d/01-init-rls.sql:ro
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U parkmesh -d parkmesh"]
       interval: 5s
@@ -53,6 +54,7 @@ services:
     environment:
       ConnectionStrings__Redis: "redis:6379"
       ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=parkmesh;Username=parkmesh;Password=parkmesh_dev_password"
+      Postgres__AppRole: "parkmesh_app"
       Mqtt__Enabled: "true"
       Mqtt__Host: "mosquitto"
       Mqtt__Port: "1883"

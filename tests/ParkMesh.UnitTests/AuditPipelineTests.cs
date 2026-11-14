@@ -1,3 +1,4 @@
+using Microsoft.Extensions.Logging.Abstractions;
 using ParkMesh.Application.Audit;
 using ParkMesh.Domain;
 using ParkMesh.Infrastructure.Audit;
@@ -46,5 +47,35 @@ public sealed class AuditPipelineTests
         Assert.True(await sink.WaitToReadAsync());
         Assert.True(sink.TryRead(out var drained));
         Assert.Equal(ev, drained);
+    }
+
+    [Fact]
+    public async Task ParkingAuditHostedService_DrainsAllBufferedEventsAcrossMultipleBatchesOnStop()
+    {
+        var sink = new AuditChannelSink(256);
+        var store = new InMemoryParkingAuditStore();
+        var service = new ParkingAuditHostedService(sink, store, NullLogger<ParkingAuditHostedService>.Instance);
+
+        var now = DateTimeOffset.UtcNow;
+        const int totalEvents = 150;
+        for (var i = 0; i < totalEvents; i++)
+        {
+            Assert.True(sink.TryEnqueue(new ParkingAuditEvent(
+                now.AddMilliseconds(i),
+                AuditEventType.BayAllocated,
+                $"F0-B{(i % 20) + 1:D2}",
+                $"DRAIN-{i}",
+                i + 1,
+                VehicleType.Standard,
+                "GATE-N1",
+                null)));
+        }
+
+        await service.StartAsync(CancellationToken.None);
+        await service.StopAsync(CancellationToken.None);
+
+        var persisted = await store.GetRecentAsync(200);
+        Assert.Equal(totalEvents, persisted.Count);
+        Assert.False(sink.TryRead(out _));
     }
 }

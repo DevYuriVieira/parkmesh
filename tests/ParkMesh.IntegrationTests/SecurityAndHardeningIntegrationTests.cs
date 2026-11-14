@@ -263,6 +263,38 @@ public sealed class SecurityAndHardeningIntegrationTests : IClassFixture<WebAppl
         Assert.True(ApiKeyValidator.IsAuthorized(headers, "super-secret-token"));
     }
 
+    [Fact]
+    public async Task AllocateEndpoint_IdempotentRetryReturnsSameBay_AndMismatchedRetryReturns409Conflict()
+    {
+        using var client = _factory.CreateClient();
+        var sessionId = $"IDEM-CAR-{Guid.NewGuid():N}";
+
+        var firstResp = await client.PostAsJsonAsync(
+            "/api/parking/allocations",
+            new { GateId = "GATE-N1", VehicleSessionId = sessionId, VehicleType = VehicleType.Standard },
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, firstResp.StatusCode);
+        var firstBody = await firstResp.Content.ReadFromJsonAsync<AllocationSummary>(JsonOptions);
+        Assert.NotNull(firstBody);
+
+        var retryResp = await client.PostAsJsonAsync(
+            "/api/parking/allocations",
+            new { GateId = "GATE-N1", VehicleSessionId = sessionId, VehicleType = VehicleType.Standard },
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, retryResp.StatusCode);
+        var retryBody = await retryResp.Content.ReadFromJsonAsync<AllocationSummary>(JsonOptions);
+        Assert.NotNull(retryBody);
+        Assert.Equal(firstBody.BayId, retryBody.BayId);
+        Assert.Equal(firstBody.FencingToken, retryBody.FencingToken);
+
+        var conflictResp = await client.PostAsJsonAsync(
+            "/api/parking/allocations",
+            new { GateId = "GATE-S1", VehicleSessionId = sessionId, VehicleType = VehicleType.EV },
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Conflict, conflictResp.StatusCode);
+    }
+
+    private sealed record AllocationSummary(string BayId, long FencingToken);
     private sealed record AuditPayload(string TenantId, int Count, long DroppedCount, List<AuditEventItem> Events);
     private sealed record AuditEventItem(string BayId, string? SessionId, string TenantId);
 }
