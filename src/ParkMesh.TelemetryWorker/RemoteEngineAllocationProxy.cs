@@ -99,6 +99,9 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
 
     public IReadOnlyCollection<ActiveVehicleSession> GetActiveSessions() => Array.Empty<ActiveVehicleSession>();
 
+    public Task<IReadOnlyList<ExpiredLeaseInfo>> PurgeExpiredSessionsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExpiredLeaseInfo>>(Array.Empty<ExpiredLeaseInfo>());
+
     public void Dispose() => _httpClient.Dispose();
 
     private sealed record AllocationEnvelope(ActiveVehicleSession Session, double ComputationTimeMs);

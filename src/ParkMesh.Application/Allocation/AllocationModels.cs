@@ -30,3 +30,9 @@ public sealed record PhysicalOccupancyResult(
     bool WasIntruder,
     string? DisplacedSessionId,
     ActiveVehicleSession? ReroutedSession);
+
+public sealed record ExpiredLeaseInfo(
+    string BayId,
+    string VehicleSessionId,
+    long FencingToken,
+    DateTimeOffset ExpiredAtUtc);

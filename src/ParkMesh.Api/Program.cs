@@ -31,6 +31,7 @@ builder.Services.AddParkMeshTelemetry(builder.Configuration);
 builder.Services.AddSingleton<SignalRParkingEventSink>();
 builder.Services.AddSingleton<IParkingEventSink>(sp => sp.GetRequiredService<SignalRParkingEventSink>());
 builder.Services.AddHostedService<MetricsBroadcastHostedService>();
+builder.Services.AddHostedService<LeaseExpirationSweeperHostedService>();
 
 var otlpEndpoint = builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"];
 builder.Services
