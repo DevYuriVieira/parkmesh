@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk.Web">
+
+  <ItemGroup>
+    <ProjectReference Include="..\ParkMesh.Application\ParkMesh.Application.csproj" />
+    <ProjectReference Include="..\ParkMesh.Domain\ParkMesh.Domain.csproj" />
+    <ProjectReference Include="..\ParkMesh.Infrastructure\ParkMesh.Infrastructure.csproj" />
+  </ItemGroup>
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+  </PropertyGroup>
+
+</Project>
