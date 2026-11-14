@@ -53,29 +53,80 @@ public sealed class AuditPipelineTests
     public async Task ParkingAuditHostedService_DrainsAllBufferedEventsAcrossMultipleBatchesOnStop()
     {
         var sink = new AuditChannelSink(256);
-        var store = new InMemoryParkingAuditStore();
+        var store = new GateableAuditStore();
         var service = new ParkingAuditHostedService(sink, store, NullLogger<ParkingAuditHostedService>.Instance);
 
+        await service.StartAsync(CancellationToken.None);
+        await store.Initialized.Task;
+
+        // Enqueue one trigger event to enter the first RecordBatchAsync and pause there,
+        // then enqueue 150 more events before triggering shutdown so all remaining batches
+        // must be drained inside the ExecuteAsync finally block.
         var now = DateTimeOffset.UtcNow;
-        const int totalEvents = 150;
-        for (var i = 0; i < totalEvents; i++)
+        Assert.True(sink.TryEnqueue(new ParkingAuditEvent(
+            now,
+            AuditEventType.BayAllocated,
+            "F0-B01",
+            "DRAIN-TRIGGER",
+            1,
+            VehicleType.Standard,
+            "GATE-N1",
+            null)));
+
+        await store.FirstBatchStarted.Task;
+
+        const int remainingEvents = 150;
+        for (var i = 0; i < remainingEvents; i++)
         {
             Assert.True(sink.TryEnqueue(new ParkingAuditEvent(
-                now.AddMilliseconds(i),
+                now.AddMilliseconds(i + 1),
                 AuditEventType.BayAllocated,
                 $"F0-B{(i % 20) + 1:D2}",
                 $"DRAIN-{i}",
-                i + 1,
+                i + 2,
                 VehicleType.Standard,
                 "GATE-N1",
                 null)));
         }
 
-        await service.StartAsync(CancellationToken.None);
-        await service.StopAsync(CancellationToken.None);
+        var stopTask = service.StopAsync(CancellationToken.None);
+        store.ReleaseFirstBatch.TrySetResult();
+        await stopTask;
 
-        var persisted = await store.GetRecentAsync(200);
-        Assert.Equal(totalEvents, persisted.Count);
+        var persisted = await store.Inner.GetRecentAsync(200);
+        Assert.Equal(remainingEvents + 1, persisted.Count);
         Assert.False(sink.TryRead(out _));
+    }
+
+    private sealed class GateableAuditStore : IParkingAuditStore
+    {
+        public InMemoryParkingAuditStore Inner { get; } = new();
+        public TaskCompletionSource Initialized { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstBatchStarted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ReleaseFirstBatch { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _batchCount;
+
+        public Task InitializeAsync(CancellationToken ct = default)
+        {
+            Initialized.TrySetResult();
+            return Inner.InitializeAsync(ct);
+        }
+
+        public async Task RecordBatchAsync(IReadOnlyList<ParkingAuditEvent> events, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _batchCount) == 1)
+            {
+                FirstBatchStarted.TrySetResult();
+                await ReleaseFirstBatch.Task;
+            }
+
+            await Inner.RecordBatchAsync(events, ct);
+        }
+
+        public Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(int limit = 50, CancellationToken ct = default) =>
+            Inner.GetRecentAsync(limit, ct);
+
+        public Task<bool> CheckConnectivityAsync(CancellationToken ct = default) =>
+            Inner.CheckConnectivityAsync(ct);
     }
 }
