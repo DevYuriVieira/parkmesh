@@ -103,109 +103,133 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         activity?.SetTag("parkmesh.gate_id", request.StartNodeId);
         activity?.SetTag("parkmesh.vehicle_type", request.VehicleType.ToString());
 
+        const int initialCandidateBatchSize = 15;
         var sw = Stopwatch.StartNew();
         var ttl = request.LeaseTtl ?? DefaultLeaseTtl;
-        var congestionSnapshot = _congestionTracker.Snapshot();
+        HashSet<string>? exhaustedBays = null;
 
-        var astarSw = Stopwatch.StartNew();
-        IReadOnlyList<ParkingRoute> candidates;
-        lock (_stateLock)
-        {
-            candidates = _pathfinder.FindCandidateBayRoutes(
-                _graph,
-                request.StartNodeId,
-                request.VehicleType,
-                congestionSnapshot,
-                maxCandidates: 15);
-        }
-        astarSw.Stop();
-        _metrics.RecordAStarLatency(astarSw.Elapsed.TotalMilliseconds);
-
-        if (candidates.Count == 0)
-        {
-            sw.Stop();
-            return new AllocateSpotResult(
-                false,
-                FailureReason: $"No compatible free bay available for vehicle type '{request.VehicleType}'.",
-                ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
-        }
-
-        foreach (var candidateRoute in candidates)
+        while (true)
         {
             ct.ThrowIfCancellationRequested();
 
-            var leaseSw = Stopwatch.StartNew();
-            var lease = await _leaseManager.TryAcquireLeaseAsync(
-                candidateRoute.TargetBayId,
-                request.VehicleSessionId,
-                ttl,
-                ct);
-            leaseSw.Stop();
-            _metrics.RecordRedisLeaseLatency(leaseSw.Elapsed.TotalMilliseconds);
+            var congestionSnapshot = _congestionTracker.Snapshot();
+            var requestedCandidates = exhaustedBays is null
+                ? initialCandidateBatchSize
+                : Math.Min(_graph.BaysById.Count, exhaustedBays.Count + initialCandidateBatchSize);
 
-            if (!lease.Acquired)
-            {
-                _metrics.RecordContentionRetry();
-                _logger.LogDebug(
-                    "Lease contention on bay {BayId} for session {SessionId}; falling back to next candidate.",
-                    candidateRoute.TargetBayId,
-                    request.VehicleSessionId);
-                continue;
-            }
-
-            var allocatedAt = _timeProvider.GetUtcNow();
-            var expiresAt = lease.ExpiresAtUtc ?? allocatedAt.Add(ttl);
-            bool committedLocally;
+            var astarSw = Stopwatch.StartNew();
+            IReadOnlyList<ParkingRoute> candidates;
             lock (_stateLock)
             {
-                var bay = _graph.BaysById[candidateRoute.TargetBayId];
-                committedLocally = bay.TrySetLeased(request.VehicleSessionId, lease.FencingToken, expiresAt);
+                candidates = _pathfinder.FindCandidateBayRoutes(
+                    _graph,
+                    request.StartNodeId,
+                    request.VehicleType,
+                    congestionSnapshot,
+                    maxCandidates: requestedCandidates);
             }
+            astarSw.Stop();
+            _metrics.RecordAStarLatency(astarSw.Elapsed.TotalMilliseconds);
 
-            if (!committedLocally)
+            if (candidates.Count == 0 && exhaustedBays is null)
             {
-                await _leaseManager.TryReleaseLeaseAsync(candidateRoute.TargetBayId, lease.FencingToken, ct);
-                continue;
+                sw.Stop();
+                return new AllocateSpotResult(
+                    false,
+                    FailureReason: $"No compatible free bay available for vehicle type '{request.VehicleType}'.",
+                    ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
             }
 
-            var session = new ActiveVehicleSession(
-                request.VehicleSessionId,
-                request.VehicleType,
-                candidateRoute.TargetBayId,
-                lease.FencingToken,
-                candidateRoute,
-                request.StartNodeId,
-                allocatedAt,
-                expiresAt);
+            var attemptedNewCandidate = false;
+            foreach (var candidateRoute in candidates)
+            {
+                ct.ThrowIfCancellationRequested();
 
-            _sessions[request.VehicleSessionId] = session;
-            _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
-            _metrics.RecordAllocation();
-            activity?.SetTag("parkmesh.bay_id", candidateRoute.TargetBayId);
-            activity?.SetTag("parkmesh.fencing_token", lease.FencingToken);
+                if (exhaustedBays is not null && exhaustedBays.Contains(candidateRoute.TargetBayId))
+                    continue;
 
-            await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
-            await _eventSink.OnBayAllocatedAsync(session, ct);
-            EnqueueAudit(
-                allocatedAt,
-                AuditEventType.BayAllocated,
-                session.AssignedBayId,
-                session.VehicleSessionId,
-                session.FencingToken,
-                session.VehicleType,
-                request.StartNodeId,
-                $"cost={candidateRoute.TotalCost:F2}");
+                attemptedNewCandidate = true;
 
-            sw.Stop();
-            _logger.LogInformation(
-                "Allocated bay {BayId} (fence={FencingToken}, cost={Cost:F2}) to session {SessionId} in {ElapsedMs:F2}ms.",
-                candidateRoute.TargetBayId,
-                lease.FencingToken,
-                candidateRoute.TotalCost,
-                request.VehicleSessionId,
-                sw.Elapsed.TotalMilliseconds);
+                var leaseSw = Stopwatch.StartNew();
+                var lease = await _leaseManager.TryAcquireLeaseAsync(
+                    candidateRoute.TargetBayId,
+                    request.VehicleSessionId,
+                    ttl,
+                    ct);
+                leaseSw.Stop();
+                _metrics.RecordRedisLeaseLatency(leaseSw.Elapsed.TotalMilliseconds);
 
-            return new AllocateSpotResult(true, session, ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
+                if (!lease.Acquired)
+                {
+                    exhaustedBays ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    exhaustedBays.Add(candidateRoute.TargetBayId);
+                    _metrics.RecordContentionRetry();
+                    _logger.LogDebug(
+                        "Lease contention on bay {BayId} for session {SessionId}; falling back to next candidate.",
+                        candidateRoute.TargetBayId,
+                        request.VehicleSessionId);
+                    continue;
+                }
+
+                var allocatedAt = _timeProvider.GetUtcNow();
+                var expiresAt = lease.ExpiresAtUtc ?? allocatedAt.Add(ttl);
+                bool committedLocally;
+                lock (_stateLock)
+                {
+                    var bay = _graph.BaysById[candidateRoute.TargetBayId];
+                    committedLocally = bay.TrySetLeased(request.VehicleSessionId, lease.FencingToken, expiresAt);
+                }
+
+                if (!committedLocally)
+                {
+                    await _leaseManager.TryReleaseLeaseAsync(candidateRoute.TargetBayId, lease.FencingToken, ct);
+                    exhaustedBays ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    exhaustedBays.Add(candidateRoute.TargetBayId);
+                    continue;
+                }
+
+                var session = new ActiveVehicleSession(
+                    request.VehicleSessionId,
+                    request.VehicleType,
+                    candidateRoute.TargetBayId,
+                    lease.FencingToken,
+                    candidateRoute,
+                    request.StartNodeId,
+                    allocatedAt,
+                    expiresAt);
+
+                _sessions[request.VehicleSessionId] = session;
+                _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
+                _metrics.RecordAllocation();
+                activity?.SetTag("parkmesh.bay_id", candidateRoute.TargetBayId);
+                activity?.SetTag("parkmesh.fencing_token", lease.FencingToken);
+
+                await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
+                await _eventSink.OnBayAllocatedAsync(session, ct);
+                EnqueueAudit(
+                    allocatedAt,
+                    AuditEventType.BayAllocated,
+                    session.AssignedBayId,
+                    session.VehicleSessionId,
+                    session.FencingToken,
+                    session.VehicleType,
+                    request.StartNodeId,
+                    $"cost={candidateRoute.TotalCost:F2}");
+
+                sw.Stop();
+                _logger.LogInformation(
+                    "Allocated bay {BayId} (fence={FencingToken}, cost={Cost:F2}) to session {SessionId} in {ElapsedMs:F2}ms.",
+                    candidateRoute.TargetBayId,
+                    lease.FencingToken,
+                    candidateRoute.TotalCost,
+                    request.VehicleSessionId,
+                    sw.Elapsed.TotalMilliseconds);
+
+                return new AllocateSpotResult(true, session, ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
+            }
+
+            if (!attemptedNewCandidate || (exhaustedBays?.Count ?? 0) >= _graph.BaysById.Count)
+                break;
         }
 
         sw.Stop();

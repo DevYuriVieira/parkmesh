@@ -140,4 +140,120 @@ public sealed class DomainAndAllocationEdgeTests
         Assert.InRange(percentiles.P95Ms, 98.0, 100.0);
         Assert.InRange(percentiles.P99Ms, 99.0, 100.0);
     }
+
+    [Fact]
+    public async Task AllocateAsync_Under40WayAsyncContention_ReplansPastExhaustedBatchAndAllSucceed()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var leaseManager = new BarrierAsyncLeaseManager(expectedInitialArrivals: 40);
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            leaseManager,
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance);
+
+        var tasks = Enumerable.Range(1, 40)
+            .Select(i => service.AllocateAsync(
+                new AllocateSpotRequest("GATE-N1", $"ASYNC-CAR-{i:D2}", VehicleType.Standard)))
+            .ToArray();
+
+        var results = await Task.WhenAll(tasks);
+
+        Assert.All(results, r => Assert.True(r.Succeeded, r.FailureReason));
+        var bayIds = results.Select(r => r.Session!.AssignedBayId).ToList();
+        Assert.Equal(40, bayIds.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+    }
+
+    [Fact]
+    public async Task AllocateAsync_WhenAllCompatibleBaysRejectedByLeaseStore_TerminatesWithRetryReason()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var rejectingLeaseManager = new AlwaysContendedLeaseManager();
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            rejectingLeaseManager,
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance);
+
+        var result = await service.AllocateAsync(
+            new AllocateSpotRequest("GATE-N1", "REMOTE-CONTENDED", VehicleType.EV));
+
+        Assert.False(result.Succeeded);
+        Assert.Equal("All candidate bays were claimed concurrently. Please retry.", result.FailureReason);
+        Assert.True(rejectingLeaseManager.Attempts > 15);
+    }
+
+    private sealed class BarrierAsyncLeaseManager(int expectedInitialArrivals) : IBayLeaseManager
+    {
+        private readonly InMemoryBayLeaseManager _inner = new();
+        private readonly TaskCompletionSource _allArrived = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _arrivals;
+
+        public async Task<LeaseAcquireResult> TryAcquireLeaseAsync(
+            string bayId,
+            string vehicleSessionId,
+            TimeSpan ttl,
+            CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _arrivals) >= expectedInitialArrivals)
+                _allArrived.TrySetResult();
+
+            await _allArrived.Task.WaitAsync(ct);
+            await Task.Yield();
+            return await _inner.TryAcquireLeaseAsync(bayId, vehicleSessionId, ttl, ct);
+        }
+
+        public Task<bool> TryReleaseLeaseAsync(string bayId, long fencingToken, CancellationToken ct = default) =>
+            _inner.TryReleaseLeaseAsync(bayId, fencingToken, ct);
+
+        public Task<bool> InvalidateLeaseAsync(string bayId, CancellationToken ct = default) =>
+            _inner.InvalidateLeaseAsync(bayId, ct);
+
+        public Task<string?> GetActiveLeaseHolderAsync(string bayId, CancellationToken ct = default) =>
+            _inner.GetActiveLeaseHolderAsync(bayId, ct);
+
+        public Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+            IReadOnlyCollection<string> bayIds,
+            CancellationToken ct = default) =>
+            _inner.GetActiveLeasesAsync(bayIds, ct);
+
+        public Task<bool> PingAsync(CancellationToken ct = default) =>
+            _inner.PingAsync(ct);
+    }
+
+    private sealed class AlwaysContendedLeaseManager : IBayLeaseManager
+    {
+        private int _attempts;
+
+        public int Attempts => Volatile.Read(ref _attempts);
+
+        public Task<LeaseAcquireResult> TryAcquireLeaseAsync(
+            string bayId,
+            string vehicleSessionId,
+            TimeSpan ttl,
+            CancellationToken ct = default)
+        {
+            Interlocked.Increment(ref _attempts);
+            return Task.FromResult(new LeaseAcquireResult(false, 0, null, "Lease already held"));
+        }
+
+        public Task<bool> TryReleaseLeaseAsync(string bayId, long fencingToken, CancellationToken ct = default) =>
+            Task.FromResult(false);
+
+        public Task<bool> InvalidateLeaseAsync(string bayId, CancellationToken ct = default) =>
+            Task.FromResult(false);
+
+        public Task<string?> GetActiveLeaseHolderAsync(string bayId, CancellationToken ct = default) =>
+            Task.FromResult<string?>(null);
+
+        public Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+            IReadOnlyCollection<string> bayIds,
+            CancellationToken ct = default) =>
+            Task.FromResult<IReadOnlyList<ActiveLeaseSnapshot>>(Array.Empty<ActiveLeaseSnapshot>());
+
+        public Task<bool> PingAsync(CancellationToken ct = default) =>
+            Task.FromResult(true);
+    }
 }
