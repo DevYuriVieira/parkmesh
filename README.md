@@ -18,11 +18,11 @@
   - Ingests raw sensor telemetry through a `BoundedChannel<T>` (`DropOldest` backpressure policy) and stabilizes noisy ultrasonic readings with debounce hysteresis (minimum consecutive samples + stability window) before applying domain transitions.
 - **SignalR Delta Streaming, Chaos Testing & OpenTelemetry (`ParkMesh.Api`, `web/`)**:
   - Streams incremental state updates (`RouteAssigned`, `RouteReassigned`, `BayStateChanged`, `VehicleMoved`, `LedPanelUpdated`, `MetricsTick`) over `/hubs/parking`, exposes chaos endpoints (`/api/parking/chaos/intruder`, `/api/parking/chaos/burst`), Prometheus scraping (`/metrics`), and OpenTelemetry (`Meter("ParkMesh.Engine")`, `ActivitySource("ParkMesh.Engine")`), and serves a zero-build 2D multi-floor dashboard at `/`.
-- **Durable Audit Outbox, Startup Hydration, Maintenance & Edge Hardening (`ParkMesh.Application`, `ParkMesh.Infrastructure`, `ParkMesh.Api`)**:
-  - Records lifecycle audit events non-blockingly via bounded `AuditChannelSink` flushed in batches to PostgreSQL (`PostgresParkingAuditStore` / `Npgsql`) with automatic in-memory fallback (`InMemoryParkingAuditStore`).
+- **Durable Audit Outbox (PostgreSQL RLS), Startup Hydration, Maintenance & Edge Hardening (`ParkMesh.Application`, `ParkMesh.Infrastructure`, `ParkMesh.Api`)**:
+  - Records tenant-scoped lifecycle audit events non-blockingly via bounded `AuditChannelSink` flushed in per-tenant transactions (`set_config('app.current_tenant', ..., true)`) to PostgreSQL (`PostgresParkingAuditStore`) protected by `ENABLE`/`FORCE ROW LEVEL SECURITY` fail-closed policies, with matching tenant-isolated `InMemoryParkingAuditStore` fallback.
   - Hydrates active Redis TTL leases (via batched `StringGetWithExpiryAsync`) and latest physical/maintenance bay states from audit storage on boot (`GarageStateHydrationHostedService`) before gating `/health/ready` (`hydrated: true`).
   - Supports operational bay maintenance (`PATCH /api/parking/bays/{bayId}/maintenance`) directly via API or 2D canvas clicks, automatically rerouting any displaced `Leased` vehicle mid-trip.
-  - Sweeps expired no-show leases via `LeaseExpirationSweeperHostedService`, restores edge weights, serves an OpenAPI 3 specification at `/openapi/v1.json`, and enforces configurable `X-Api-Key` authentication + chaos rate limiting.
+  - Enforces SHA-256 constant-time `X-Api-Key` verification across mutation and audit endpoints (when configured), strict `X-Tenant-Id` validation and optional `Security:AllowedTenants` allowlisting, security headers/CSP/request size limits, chaos rate limiting, lease expiration sweeping (`LeaseExpirationSweeperHostedService`), and `/openapi/v1.json`.
 
 ---
 
