@@ -3,6 +3,7 @@ using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Routing;
+using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 
 namespace ParkMesh.Application.Allocation;
@@ -34,6 +35,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     private readonly IPathfinder _pathfinder;
     private readonly IBayLeaseManager _leaseManager;
     private readonly IEdgeCongestionTracker _congestionTracker;
+    private readonly ILedPanelPublisher _ledPublisher;
+    private readonly IParkingEventSink _eventSink;
     private readonly ILogger<ParkingAllocationService> _logger;
     private readonly ConcurrentDictionary<string, ActiveVehicleSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _stateLock = new();
@@ -43,13 +46,17 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         IPathfinder pathfinder,
         IBayLeaseManager leaseManager,
         IEdgeCongestionTracker congestionTracker,
-        ILogger<ParkingAllocationService> logger)
+        ILogger<ParkingAllocationService> logger,
+        ILedPanelPublisher? ledPublisher = null,
+        IParkingEventSink? eventSink = null)
     {
         _graph = graph;
         _pathfinder = pathfinder;
         _leaseManager = leaseManager;
         _congestionTracker = congestionTracker;
         _logger = logger;
+        _ledPublisher = ledPublisher ?? NullLedPanelPublisher.Instance;
+        _eventSink = eventSink ?? NullParkingEventSink.Instance;
     }
 
     public ParkingGraph Graph => _graph;
@@ -135,6 +142,9 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             _sessions[request.VehicleSessionId] = session;
             _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
 
+            await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
+            await _eventSink.OnBayAllocatedAsync(session, ct);
+
             sw.Stop();
             _logger.LogInformation(
                 "Allocated bay {BayId} (fence={FencingToken}, cost={Cost:F2}) to session {SessionId} in {ElapsedMs:F2}ms.",
@@ -206,6 +216,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             if (departed is not null)
                 _congestionTracker.RemoveRouteLoad(departed.Route.Steps.Select(s => s.EdgeId));
 
+            await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Free, ct);
             return new PhysicalOccupancyResult(bayId, BayStatus.Free, false, null, null);
         }
 
@@ -236,6 +247,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
         if (!wasIntruder || displacedSession is null)
         {
+            await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
             return new PhysicalOccupancyResult(bayId, BayStatus.Occupied, false, null, null);
         }
 
@@ -254,12 +266,16 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 displacedSession.VehicleType),
             ct);
 
+        var newSession = rerouteResult.Succeeded ? rerouteResult.Session : null;
+        await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
+        await _eventSink.OnRouteReassignedAsync(bayId, displacedSession.VehicleSessionId, newSession, ct);
+
         return new PhysicalOccupancyResult(
             bayId,
             BayStatus.Occupied,
             WasIntruder: true,
             DisplacedSessionId: displacedSession.VehicleSessionId,
-            ReroutedSession: rerouteResult.Succeeded ? rerouteResult.Session : null);
+            ReroutedSession: newSession);
     }
 
     public bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId)
