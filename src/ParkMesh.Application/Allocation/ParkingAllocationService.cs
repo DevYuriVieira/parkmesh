@@ -24,6 +24,8 @@ public interface IParkingAllocationService
 
     bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId);
 
+    ValueTask<bool> UpdateVehicleProgressAsync(string vehicleSessionId, string currentNodeId, CancellationToken ct = default);
+
     IReadOnlyCollection<ActiveVehicleSession> GetActiveSessions();
 }
 
@@ -37,6 +39,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     private readonly IEdgeCongestionTracker _congestionTracker;
     private readonly ILedPanelPublisher _ledPublisher;
     private readonly IParkingEventSink _eventSink;
+    private readonly IEngineMetricsRecorder _metrics;
     private readonly ILogger<ParkingAllocationService> _logger;
     private readonly ConcurrentDictionary<string, ActiveVehicleSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
     private readonly Lock _stateLock = new();
@@ -48,7 +51,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         IEdgeCongestionTracker congestionTracker,
         ILogger<ParkingAllocationService> logger,
         ILedPanelPublisher? ledPublisher = null,
-        IParkingEventSink? eventSink = null)
+        IParkingEventSink? eventSink = null,
+        IEngineMetricsRecorder? metrics = null)
     {
         _graph = graph;
         _pathfinder = pathfinder;
@@ -57,6 +61,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         _logger = logger;
         _ledPublisher = ledPublisher ?? NullLedPanelPublisher.Instance;
         _eventSink = eventSink ?? NullParkingEventSink.Instance;
+        _metrics = metrics ?? NullEngineMetricsRecorder.Instance;
     }
 
     public ParkingGraph Graph => _graph;
@@ -72,10 +77,15 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             return new AllocateSpotResult(false, FailureReason: $"Unknown start node '{request.StartNodeId}'.");
         }
 
+        using var activity = EngineMetricsRecorder.ActivitySource.StartActivity("parkmesh.allocate");
+        activity?.SetTag("parkmesh.gate_id", request.StartNodeId);
+        activity?.SetTag("parkmesh.vehicle_type", request.VehicleType.ToString());
+
         var sw = Stopwatch.StartNew();
         var ttl = request.LeaseTtl ?? DefaultLeaseTtl;
         var congestionSnapshot = _congestionTracker.Snapshot();
 
+        var astarSw = Stopwatch.StartNew();
         IReadOnlyList<ParkingRoute> candidates;
         lock (_stateLock)
         {
@@ -86,6 +96,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 congestionSnapshot,
                 maxCandidates: 15);
         }
+        astarSw.Stop();
+        _metrics.RecordAStarLatency(astarSw.Elapsed.TotalMilliseconds);
 
         if (candidates.Count == 0)
         {
@@ -100,14 +112,18 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         {
             ct.ThrowIfCancellationRequested();
 
+            var leaseSw = Stopwatch.StartNew();
             var lease = await _leaseManager.TryAcquireLeaseAsync(
                 candidateRoute.TargetBayId,
                 request.VehicleSessionId,
                 ttl,
                 ct);
+            leaseSw.Stop();
+            _metrics.RecordRedisLeaseLatency(leaseSw.Elapsed.TotalMilliseconds);
 
             if (!lease.Acquired)
             {
+                _metrics.RecordContentionRetry();
                 _logger.LogDebug(
                     "Lease contention on bay {BayId} for session {SessionId}; falling back to next candidate.",
                     candidateRoute.TargetBayId,
@@ -141,6 +157,9 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
             _sessions[request.VehicleSessionId] = session;
             _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
+            _metrics.RecordAllocation();
+            activity?.SetTag("parkmesh.bay_id", candidateRoute.TargetBayId);
+            activity?.SetTag("parkmesh.fencing_token", lease.FencingToken);
 
             await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
             await _eventSink.OnBayAllocatedAsync(session, ct);
@@ -259,6 +278,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             displacedSession.VehicleSessionId,
             displacedSession.LastKnownNodeId);
 
+        _metrics.RecordReroute();
         var rerouteResult = await AllocateAsync(
             new AllocateSpotRequest(
                 displacedSession.LastKnownNodeId,
@@ -287,6 +307,18 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             return false;
 
         _sessions[vehicleSessionId] = current with { LastKnownNodeId = currentNodeId };
+        return true;
+    }
+
+    public async ValueTask<bool> UpdateVehicleProgressAsync(
+        string vehicleSessionId,
+        string currentNodeId,
+        CancellationToken ct = default)
+    {
+        if (!UpdateVehicleProgress(vehicleSessionId, currentNodeId))
+            return false;
+
+        await _eventSink.OnVehicleMovedAsync(vehicleSessionId, currentNodeId, ct);
         return true;
     }
 
