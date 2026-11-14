@@ -2,6 +2,7 @@ using System.Collections.Concurrent;
 using System.Diagnostics;
 using Microsoft.Extensions.Logging;
 using ParkMesh.Application.Abstractions;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Routing;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
@@ -42,6 +43,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     private readonly ILedPanelPublisher _ledPublisher;
     private readonly IParkingEventSink _eventSink;
     private readonly IEngineMetricsRecorder _metrics;
+    private readonly IParkingAuditSink _auditSink;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ParkingAllocationService> _logger;
     private readonly ConcurrentDictionary<string, ActiveVehicleSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
@@ -56,7 +58,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         ILedPanelPublisher? ledPublisher = null,
         IParkingEventSink? eventSink = null,
         IEngineMetricsRecorder? metrics = null,
-        TimeProvider? timeProvider = null)
+        TimeProvider? timeProvider = null,
+        IParkingAuditSink? auditSink = null)
     {
         _graph = graph;
         _pathfinder = pathfinder;
@@ -67,6 +70,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         _eventSink = eventSink ?? NullParkingEventSink.Instance;
         _metrics = metrics ?? NullEngineMetricsRecorder.Instance;
         _timeProvider = timeProvider ?? TimeProvider.System;
+        _auditSink = auditSink ?? NullParkingAuditSink.Instance;
     }
 
     public ParkingGraph Graph => _graph;
@@ -169,6 +173,15 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
             await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
             await _eventSink.OnBayAllocatedAsync(session, ct);
+            _auditSink.TryEnqueue(new ParkingAuditEvent(
+                allocatedAt,
+                AuditEventType.BayAllocated,
+                session.AssignedBayId,
+                session.VehicleSessionId,
+                session.FencingToken,
+                session.VehicleType,
+                request.StartNodeId,
+                $"cost={candidateRoute.TotalCost:F2}"));
 
             sw.Stop();
             _logger.LogInformation(
@@ -214,6 +227,16 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             _congestionTracker.RemoveRouteLoad(removedSession.Route.Steps.Select(s => s.EdgeId));
         }
 
+        _auditSink.TryEnqueue(new ParkingAuditEvent(
+            _timeProvider.GetUtcNow(),
+            AuditEventType.LeaseReleased,
+            bayId,
+            removedSession?.VehicleSessionId,
+            fencingToken,
+            removedSession?.VehicleType,
+            removedSession?.LastKnownNodeId,
+            null));
+
         return true;
     }
 
@@ -242,6 +265,16 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 _congestionTracker.RemoveRouteLoad(departed.Route.Steps.Select(s => s.EdgeId));
 
             await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Free, ct);
+            _auditSink.TryEnqueue(new ParkingAuditEvent(
+                _timeProvider.GetUtcNow(),
+                AuditEventType.PhysicalVacated,
+                bayId,
+                departed?.VehicleSessionId,
+                departed?.FencingToken,
+                departed?.VehicleType,
+                departed?.LastKnownNodeId,
+                null));
+
             return new PhysicalOccupancyResult(bayId, BayStatus.Free, false, null, null);
         }
 
@@ -273,6 +306,15 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         if (!wasIntruder || displacedSession is null)
         {
             await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
+            _auditSink.TryEnqueue(new ParkingAuditEvent(
+                _timeProvider.GetUtcNow(),
+                AuditEventType.PhysicalOccupied,
+                bayId,
+                occupantSessionId,
+                null,
+                null,
+                null,
+                null));
             return new PhysicalOccupancyResult(bayId, BayStatus.Occupied, false, null, null);
         }
 
@@ -295,6 +337,15 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         var newSession = rerouteResult.Succeeded ? rerouteResult.Session : null;
         await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
         await _eventSink.OnRouteReassignedAsync(bayId, displacedSession.VehicleSessionId, newSession, ct);
+        _auditSink.TryEnqueue(new ParkingAuditEvent(
+            _timeProvider.GetUtcNow(),
+            AuditEventType.IntrusionRerouted,
+            bayId,
+            displacedSession.VehicleSessionId,
+            newSession?.FencingToken,
+            displacedSession.VehicleType,
+            displacedSession.LastKnownNodeId,
+            newSession is not null ? $"reroutedBay={newSession.AssignedBayId};intruder={occupantSessionId}" : $"rerouteFailed;intruder={occupantSessionId}"));
 
         return new PhysicalOccupancyResult(
             bayId,
@@ -362,6 +413,15 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             await _leaseManager.TryReleaseLeaseAsync(purged.AssignedBayId, purged.FencingToken, ct);
             _metrics.RecordLeaseExpired();
             await _eventSink.OnPhysicalOccupancyChangedAsync(purged.AssignedBayId, BayStatus.Free, ct);
+            _auditSink.TryEnqueue(new ParkingAuditEvent(
+                now,
+                AuditEventType.LeaseExpired,
+                purged.AssignedBayId,
+                purged.VehicleSessionId,
+                purged.FencingToken,
+                purged.VehicleType,
+                purged.LastKnownNodeId,
+                null));
 
             _logger.LogInformation(
                 "Purged expired lease for bay {BayId} (fence={FencingToken}, session={SessionId}).",

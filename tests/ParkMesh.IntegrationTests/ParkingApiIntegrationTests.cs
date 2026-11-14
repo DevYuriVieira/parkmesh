@@ -6,6 +6,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc.Testing;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 
@@ -229,6 +230,56 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         Assert.True(metrics.EnqueuedCount >= 1);
     }
 
+    [Fact]
+    public async Task AuditEndpoint_RecordsAllocationIntrusionAndReleaseEvents()
+    {
+        var sessionId = $"AUDIT-{Guid.NewGuid():N}"[..14];
+        var allocateResponse = await _client.PostAsJsonAsync(
+            "/api/parking/allocations",
+            new AllocateSpotApiRequest("GATE-N1", sessionId, VehicleType.Standard, 90),
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Created, allocateResponse.StatusCode);
+        var created = await allocateResponse.Content.ReadFromJsonAsync<AllocationEnvelope>(JsonOptions);
+        Assert.NotNull(created?.Session);
+
+        var intruderResponse = await _client.PostAsJsonAsync(
+            $"/api/parking/bays/{created.Session.AssignedBayId}/occupancy",
+            new PhysicalOccupancyApiRequest(true, "INTRUDER-AUD"),
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, intruderResponse.StatusCode);
+        var intruder = await intruderResponse.Content.ReadFromJsonAsync<PhysicalOccupancyResult>(JsonOptions);
+        Assert.NotNull(intruder?.ReroutedSession);
+
+        await _client.DeleteAsync(
+            $"/api/parking/allocations/{intruder.ReroutedSession.AssignedBayId}?fencingToken={intruder.ReroutedSession.FencingToken}");
+
+        await _client.PostAsJsonAsync(
+            $"/api/parking/bays/{created.Session.AssignedBayId}/occupancy",
+            new PhysicalOccupancyApiRequest(false, null),
+            JsonOptions);
+
+        AuditResponse? audit = null;
+        for (var attempt = 0; attempt < 25; attempt++)
+        {
+            audit = await _client.GetFromJsonAsync<AuditResponse>("/api/parking/audit?limit=50", JsonOptions);
+            if (audit is not null
+                && audit.Events.Any(e => e.SessionId == sessionId && e.EventType == AuditEventType.IntrusionRerouted)
+                && audit.Events.Any(e => e.SessionId == sessionId && e.EventType == AuditEventType.LeaseReleased))
+            {
+                break;
+            }
+
+            await Task.Delay(50);
+        }
+
+        Assert.NotNull(audit);
+        Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.BayAllocated);
+        Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.IntrusionRerouted);
+        Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.LeaseReleased);
+    }
+
     private static bool IsHubTarget(JsonDocument doc, string targetName) =>
         doc.RootElement.TryGetProperty("type", out var t)
         && t.GetInt32() == 1
@@ -292,4 +343,5 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
     private sealed record TopologySummary(int Floors, int TotalNodes, int TotalEdges, int TotalBays);
     private sealed record AllocationEnvelope(ActiveVehicleSession Session, double ComputationTimeMs);
     private sealed record BurstEnvelope(int Requested, int Succeeded, int Failed, List<ActiveVehicleSession> Sessions);
+    private sealed record AuditResponse(int Count, long DroppedCount, List<ParkingAuditEvent> Events);
 }

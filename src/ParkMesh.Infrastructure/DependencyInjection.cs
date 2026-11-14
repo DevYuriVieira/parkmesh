@@ -3,9 +3,11 @@ using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Options;
 using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Routing;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
+using ParkMesh.Infrastructure.Audit;
 using ParkMesh.Infrastructure.Mqtt;
 using ParkMesh.Infrastructure.Redis;
 using StackExchange.Redis;
@@ -20,6 +22,7 @@ public static class DependencyInjection
         services.AddSingleton<IPathfinder, AStarPathfinder>();
         services.AddSingleton<IEdgeCongestionTracker, InMemoryEdgeCongestionTracker>();
         services.AddSingleton<IEngineMetricsRecorder, EngineMetricsRecorder>();
+        services.AddSingleton<IParkingAuditSink>(_ => new AuditChannelSink());
         services.AddSingleton<IParkingAllocationService, ParkingAllocationService>();
         return services;
     }
@@ -61,6 +64,19 @@ public static class DependencyInjection
         {
             services.AddSingleton<IBayLeaseManager, InMemoryBayLeaseManager>();
         }
+
+        var postgresConnectionString = configuration.GetConnectionString("Postgres");
+        if (!string.IsNullOrWhiteSpace(postgresConnectionString))
+        {
+            services.AddSingleton<IParkingAuditStore>(_ =>
+                new PostgresParkingAuditStore(postgresConnectionString));
+        }
+        else
+        {
+            services.AddSingleton<IParkingAuditStore, InMemoryParkingAuditStore>();
+        }
+
+        services.AddHostedService<ParkingAuditHostedService>();
 
         return services;
     }

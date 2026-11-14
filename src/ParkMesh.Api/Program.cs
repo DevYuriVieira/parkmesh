@@ -1,11 +1,13 @@
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.Extensions.FileProviders;
+using Npgsql;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using ParkMesh.Api.Realtime;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 using ParkMesh.Infrastructure;
@@ -41,7 +43,8 @@ builder.Services
     {
         tracing
             .AddSource(EngineMetricsRecorder.ActivitySourceName)
-            .AddAspNetCoreInstrumentation();
+            .AddAspNetCoreInstrumentation()
+            .AddNpgsql();
 
         if (!string.IsNullOrWhiteSpace(otlpEndpoint))
             tracing.AddOtlpExporter();
@@ -99,6 +102,21 @@ app.MapGet("/api/parking/metrics", (
 {
     var sessions = allocationService.GetActiveSessions();
     return Results.Ok(metrics.BuildSnapshot(allocationService.Graph, sessions.Count, telemetryChannel.GetMetrics()));
+});
+
+app.MapGet("/api/parking/audit", async (
+    [FromQuery] int? limit,
+    IParkingAuditStore auditStore,
+    IParkingAuditSink auditSink,
+    CancellationToken ct) =>
+{
+    var items = await auditStore.GetRecentAsync(limit ?? 50, ct);
+    return Results.Ok(new
+    {
+        count = items.Count,
+        droppedCount = auditSink.DroppedCount,
+        events = items
+    });
 });
 
 app.MapGet("/api/parking/bays", (
