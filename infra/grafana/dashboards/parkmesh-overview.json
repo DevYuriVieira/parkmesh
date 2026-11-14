@@ -1,0 +1,77 @@
+{
+  "title": "ParkMesh Engine Overview",
+  "uid": "parkmesh-engine",
+  "schemaVersion": 39,
+  "version": 1,
+  "refresh": "5s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "stat",
+      "title": "Total Allocations",
+      "gridPos": { "x": 0, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(parkmesh_allocations_total)", "legendFormat": "Allocations" }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Intrusion Reroutes",
+      "gridPos": { "x": 6, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(parkmesh_reroutes_total)", "legendFormat": "Reroutes" }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Lease Contention Retries",
+      "gridPos": { "x": 12, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(parkmesh_allocations_contention_total)", "legendFormat": "Retries" }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Expired Leases Purged",
+      "gridPos": { "x": 18, "y": 0, "w": 6, "h": 4 },
+      "targets": [
+        { "expr": "sum(parkmesh_leases_expired_total)", "legendFormat": "Expired" }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "A* Routing Latency P99 (ms)",
+      "gridPos": { "x": 0, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(parkmesh_routing_astar_duration_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "A* P99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(parkmesh_routing_astar_duration_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "A* P50"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "Redis Lease Acquisition Latency P99 (ms)",
+      "gridPos": { "x": 12, "y": 4, "w": 12, "h": 8 },
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(parkmesh_lease_redis_duration_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "Redis Lease P99"
+        },
+        {
+          "expr": "histogram_quantile(0.50, sum(rate(parkmesh_lease_redis_duration_milliseconds_bucket[1m])) by (le))",
+          "legendFormat": "Redis Lease P50"
+        }
+      ]
+    }
+  ]
+}

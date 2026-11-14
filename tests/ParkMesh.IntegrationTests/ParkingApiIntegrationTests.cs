@@ -65,6 +65,11 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         var metrics = await _client.GetFromJsonAsync<EngineMetricsSnapshot>("/api/parking/metrics", JsonOptions);
         Assert.NotNull(metrics);
         Assert.Equal(120, metrics.TotalBays);
+
+        var prometheus = await _client.GetAsync("/metrics");
+        Assert.Equal(HttpStatusCode.OK, prometheus.StatusCode);
+        var prometheusBody = await prometheus.Content.ReadAsStringAsync();
+        Assert.Contains("# TYPE", prometheusBody, StringComparison.Ordinal);
     }
 
     [Fact]

@@ -89,7 +89,8 @@ builder.Services
     {
         metrics
             .AddMeter(EngineMetricsRecorder.MeterName)
-            .AddAspNetCoreInstrumentation();
+            .AddAspNetCoreInstrumentation()
+            .AddPrometheusExporter();
 
         if (!string.IsNullOrWhiteSpace(otlpEndpoint))
             metrics.AddOtlpExporter();
@@ -98,6 +99,7 @@ builder.Services
 var app = builder.Build();
 
 app.UseRateLimiter();
+app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
 var webRoot = ResolveWebDirectory(app.Environment.ContentRootPath);
 if (webRoot is not null)

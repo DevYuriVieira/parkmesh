@@ -42,5 +42,80 @@ services:
       timeout: 5s
       retries: 5
 
+  parkmesh-api:
+    build:
+      context: ..
+      dockerfile: src/ParkMesh.Api/Dockerfile
+    container_name: parkmesh-api
+    profiles: ["app", "full"]
+    ports:
+      - "5150:8080"
+    environment:
+      ConnectionStrings__Redis: "redis:6379"
+      ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=parkmesh;Username=parkmesh;Password=parkmesh_dev_password"
+      Mqtt__Enabled: "true"
+      Mqtt__Host: "mosquitto"
+      Mqtt__Port: "1883"
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      mosquitto:
+        condition: service_healthy
+
+  parkmesh-telemetry-worker:
+    build:
+      context: ..
+      dockerfile: src/ParkMesh.TelemetryWorker/Dockerfile
+    container_name: parkmesh-telemetry-worker
+    profiles: ["app", "full"]
+    environment:
+      ParkMeshApi__BaseUrl: "http://parkmesh-api:8080"
+      Mqtt__Enabled: "true"
+      Mqtt__Host: "mosquitto"
+      Mqtt__Port: "1883"
+    depends_on:
+      - parkmesh-api
+
+  parkmesh-simulator:
+    build:
+      context: ..
+      dockerfile: src/ParkMesh.Simulator/Dockerfile
+    container_name: parkmesh-simulator
+    profiles: ["app", "full"]
+    environment:
+      Simulator__ApiBaseUrl: "http://parkmesh-api:8080"
+      Mqtt__Enabled: "true"
+      Mqtt__Host: "mosquitto"
+      Mqtt__Port: "1883"
+    depends_on:
+      - parkmesh-telemetry-worker
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    container_name: parkmesh-prometheus
+    profiles: ["observability", "full"]
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+
+  grafana:
+    image: grafana/grafana:11.6.0
+    container_name: parkmesh-grafana
+    profiles: ["observability", "full"]
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+    volumes:
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources:ro
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
 volumes:
   parkmesh_pgdata:
