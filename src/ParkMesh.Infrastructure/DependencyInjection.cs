@@ -22,6 +22,7 @@ public static class DependencyInjection
         services.AddSingleton<IPathfinder, AStarPathfinder>();
         services.AddSingleton<IEdgeCongestionTracker, InMemoryEdgeCongestionTracker>();
         services.AddSingleton<IEngineMetricsRecorder, EngineMetricsRecorder>();
+        services.AddSingleton<ITenantContext, AsyncLocalTenantContext>();
         services.AddSingleton<IParkingAuditSink>(_ => new AuditChannelSink());
         services.AddSingleton<IParkingAllocationService, ParkingAllocationService>();
         return services;

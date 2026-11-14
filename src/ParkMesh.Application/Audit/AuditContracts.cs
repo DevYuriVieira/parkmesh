@@ -1,5 +1,6 @@
 using System.Diagnostics.CodeAnalysis;
 using System.Threading.Channels;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Domain;
 
 namespace ParkMesh.Application.Audit;
@@ -11,7 +12,9 @@ public enum AuditEventType
     LeaseExpired = 2,
     PhysicalOccupied = 3,
     PhysicalVacated = 4,
-    IntrusionRerouted = 5
+    IntrusionRerouted = 5,
+    BayOutOfService = 6,
+    BayRestored = 7
 }
 
 public sealed record ParkingAuditEvent(
@@ -23,7 +26,8 @@ public sealed record ParkingAuditEvent(
     VehicleType? VehicleType,
     string? NodeId,
     string? Details,
-    long Id = 0);
+    long Id = 0,
+    string TenantId = TenantDefaults.DefaultTenantId);
 
 public interface IParkingAuditSink
 {
@@ -38,6 +42,13 @@ public interface IParkingAuditStore
     Task InitializeAsync(CancellationToken ct = default);
     Task RecordBatchAsync(IReadOnlyList<ParkingAuditEvent> events, CancellationToken ct = default);
     Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(int limit = 50, CancellationToken ct = default);
+    Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(string tenantId, int limit = 50, CancellationToken ct = default) =>
+        GetRecentAsync(limit, ct);
+    Task<IReadOnlyDictionary<string, AuditEventType>> GetLatestBayPhysicalStatesAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyDictionary<string, AuditEventType>>(
+            new Dictionary<string, AuditEventType>(StringComparer.OrdinalIgnoreCase));
+    Task<IReadOnlyDictionary<string, AuditEventType>> GetLatestBayPhysicalStatesAsync(string tenantId, CancellationToken ct = default) =>
+        GetLatestBayPhysicalStatesAsync(ct);
     Task<bool> CheckConnectivityAsync(CancellationToken ct = default);
 }
 
@@ -73,6 +84,20 @@ public sealed class AuditChannelSink : IParkingAuditSink
 
     public bool TryRead([NotNullWhen(true)] out ParkingAuditEvent? auditEvent) =>
         _channel.Reader.TryRead(out auditEvent);
+}
+
+public sealed class NullParkingAuditStore : IParkingAuditStore
+{
+    public static readonly NullParkingAuditStore Instance = new();
+
+    public Task InitializeAsync(CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task RecordBatchAsync(IReadOnlyList<ParkingAuditEvent> events, CancellationToken ct = default) => Task.CompletedTask;
+
+    public Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(int limit = 50, CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ParkingAuditEvent>>(Array.Empty<ParkingAuditEvent>());
+
+    public Task<bool> CheckConnectivityAsync(CancellationToken ct = default) => Task.FromResult(true);
 }
 
 public sealed class NullParkingAuditSink : IParkingAuditSink

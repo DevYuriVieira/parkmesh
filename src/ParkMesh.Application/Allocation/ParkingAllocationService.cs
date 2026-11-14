@@ -23,6 +23,11 @@ public interface IParkingAllocationService
         string? occupantSessionId = null,
         CancellationToken ct = default);
 
+    Task<PhysicalOccupancyResult> SetBayMaintenanceAsync(
+        string bayId,
+        bool outOfService,
+        CancellationToken ct = default);
+
     bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId);
 
     ValueTask<bool> UpdateVehicleProgressAsync(string vehicleSessionId, string currentNodeId, CancellationToken ct = default);
@@ -30,6 +35,8 @@ public interface IParkingAllocationService
     IReadOnlyCollection<ActiveVehicleSession> GetActiveSessions();
 
     Task<IReadOnlyList<ExpiredLeaseInfo>> PurgeExpiredSessionsAsync(CancellationToken ct = default);
+
+    Task<int> RehydrateStateAsync(CancellationToken ct = default);
 }
 
 public sealed class ParkingAllocationService : IParkingAllocationService
@@ -44,6 +51,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     private readonly IParkingEventSink _eventSink;
     private readonly IEngineMetricsRecorder _metrics;
     private readonly IParkingAuditSink _auditSink;
+    private readonly IParkingAuditStore _auditStore;
+    private readonly ITenantContext _tenantContext;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ParkingAllocationService> _logger;
     private readonly ConcurrentDictionary<string, ActiveVehicleSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
@@ -59,7 +68,9 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         IParkingEventSink? eventSink = null,
         IEngineMetricsRecorder? metrics = null,
         TimeProvider? timeProvider = null,
-        IParkingAuditSink? auditSink = null)
+        IParkingAuditSink? auditSink = null,
+        IParkingAuditStore? auditStore = null,
+        ITenantContext? tenantContext = null)
     {
         _graph = graph;
         _pathfinder = pathfinder;
@@ -71,6 +82,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         _metrics = metrics ?? NullEngineMetricsRecorder.Instance;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _auditSink = auditSink ?? NullParkingAuditSink.Instance;
+        _auditStore = auditStore ?? NullParkingAuditStore.Instance;
+        _tenantContext = tenantContext ?? DefaultTenantContext.Instance;
     }
 
     public ParkingGraph Graph => _graph;
@@ -90,109 +103,133 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         activity?.SetTag("parkmesh.gate_id", request.StartNodeId);
         activity?.SetTag("parkmesh.vehicle_type", request.VehicleType.ToString());
 
+        const int initialCandidateBatchSize = 15;
         var sw = Stopwatch.StartNew();
         var ttl = request.LeaseTtl ?? DefaultLeaseTtl;
-        var congestionSnapshot = _congestionTracker.Snapshot();
+        HashSet<string>? exhaustedBays = null;
 
-        var astarSw = Stopwatch.StartNew();
-        IReadOnlyList<ParkingRoute> candidates;
-        lock (_stateLock)
-        {
-            candidates = _pathfinder.FindCandidateBayRoutes(
-                _graph,
-                request.StartNodeId,
-                request.VehicleType,
-                congestionSnapshot,
-                maxCandidates: 15);
-        }
-        astarSw.Stop();
-        _metrics.RecordAStarLatency(astarSw.Elapsed.TotalMilliseconds);
-
-        if (candidates.Count == 0)
-        {
-            sw.Stop();
-            return new AllocateSpotResult(
-                false,
-                FailureReason: $"No compatible free bay available for vehicle type '{request.VehicleType}'.",
-                ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
-        }
-
-        foreach (var candidateRoute in candidates)
+        while (true)
         {
             ct.ThrowIfCancellationRequested();
 
-            var leaseSw = Stopwatch.StartNew();
-            var lease = await _leaseManager.TryAcquireLeaseAsync(
-                candidateRoute.TargetBayId,
-                request.VehicleSessionId,
-                ttl,
-                ct);
-            leaseSw.Stop();
-            _metrics.RecordRedisLeaseLatency(leaseSw.Elapsed.TotalMilliseconds);
+            var congestionSnapshot = _congestionTracker.Snapshot();
+            var requestedCandidates = exhaustedBays is null
+                ? initialCandidateBatchSize
+                : Math.Min(_graph.BaysById.Count, exhaustedBays.Count + initialCandidateBatchSize);
 
-            if (!lease.Acquired)
-            {
-                _metrics.RecordContentionRetry();
-                _logger.LogDebug(
-                    "Lease contention on bay {BayId} for session {SessionId}; falling back to next candidate.",
-                    candidateRoute.TargetBayId,
-                    request.VehicleSessionId);
-                continue;
-            }
-
-            var allocatedAt = _timeProvider.GetUtcNow();
-            var expiresAt = lease.ExpiresAtUtc ?? allocatedAt.Add(ttl);
-            bool committedLocally;
+            var astarSw = Stopwatch.StartNew();
+            IReadOnlyList<ParkingRoute> candidates;
             lock (_stateLock)
             {
-                var bay = _graph.BaysById[candidateRoute.TargetBayId];
-                committedLocally = bay.TrySetLeased(request.VehicleSessionId, lease.FencingToken, expiresAt);
+                candidates = _pathfinder.FindCandidateBayRoutes(
+                    _graph,
+                    request.StartNodeId,
+                    request.VehicleType,
+                    congestionSnapshot,
+                    maxCandidates: requestedCandidates);
             }
+            astarSw.Stop();
+            _metrics.RecordAStarLatency(astarSw.Elapsed.TotalMilliseconds);
 
-            if (!committedLocally)
+            if (candidates.Count == 0 && exhaustedBays is null)
             {
-                await _leaseManager.TryReleaseLeaseAsync(candidateRoute.TargetBayId, lease.FencingToken, ct);
-                continue;
+                sw.Stop();
+                return new AllocateSpotResult(
+                    false,
+                    FailureReason: $"No compatible free bay available for vehicle type '{request.VehicleType}'.",
+                    ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
             }
 
-            var session = new ActiveVehicleSession(
-                request.VehicleSessionId,
-                request.VehicleType,
-                candidateRoute.TargetBayId,
-                lease.FencingToken,
-                candidateRoute,
-                request.StartNodeId,
-                allocatedAt,
-                expiresAt);
+            var attemptedNewCandidate = false;
+            foreach (var candidateRoute in candidates)
+            {
+                ct.ThrowIfCancellationRequested();
 
-            _sessions[request.VehicleSessionId] = session;
-            _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
-            _metrics.RecordAllocation();
-            activity?.SetTag("parkmesh.bay_id", candidateRoute.TargetBayId);
-            activity?.SetTag("parkmesh.fencing_token", lease.FencingToken);
+                if (exhaustedBays is not null && exhaustedBays.Contains(candidateRoute.TargetBayId))
+                    continue;
 
-            await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
-            await _eventSink.OnBayAllocatedAsync(session, ct);
-            _auditSink.TryEnqueue(new ParkingAuditEvent(
-                allocatedAt,
-                AuditEventType.BayAllocated,
-                session.AssignedBayId,
-                session.VehicleSessionId,
-                session.FencingToken,
-                session.VehicleType,
-                request.StartNodeId,
-                $"cost={candidateRoute.TotalCost:F2}"));
+                attemptedNewCandidate = true;
 
-            sw.Stop();
-            _logger.LogInformation(
-                "Allocated bay {BayId} (fence={FencingToken}, cost={Cost:F2}) to session {SessionId} in {ElapsedMs:F2}ms.",
-                candidateRoute.TargetBayId,
-                lease.FencingToken,
-                candidateRoute.TotalCost,
-                request.VehicleSessionId,
-                sw.Elapsed.TotalMilliseconds);
+                var leaseSw = Stopwatch.StartNew();
+                var lease = await _leaseManager.TryAcquireLeaseAsync(
+                    candidateRoute.TargetBayId,
+                    request.VehicleSessionId,
+                    ttl,
+                    ct);
+                leaseSw.Stop();
+                _metrics.RecordRedisLeaseLatency(leaseSw.Elapsed.TotalMilliseconds);
 
-            return new AllocateSpotResult(true, session, ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
+                if (!lease.Acquired)
+                {
+                    exhaustedBays ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    exhaustedBays.Add(candidateRoute.TargetBayId);
+                    _metrics.RecordContentionRetry();
+                    _logger.LogDebug(
+                        "Lease contention on bay {BayId} for session {SessionId}; falling back to next candidate.",
+                        candidateRoute.TargetBayId,
+                        request.VehicleSessionId);
+                    continue;
+                }
+
+                var allocatedAt = _timeProvider.GetUtcNow();
+                var expiresAt = lease.ExpiresAtUtc ?? allocatedAt.Add(ttl);
+                bool committedLocally;
+                lock (_stateLock)
+                {
+                    var bay = _graph.BaysById[candidateRoute.TargetBayId];
+                    committedLocally = bay.TrySetLeased(request.VehicleSessionId, lease.FencingToken, expiresAt);
+                }
+
+                if (!committedLocally)
+                {
+                    await _leaseManager.TryReleaseLeaseAsync(candidateRoute.TargetBayId, lease.FencingToken, ct);
+                    exhaustedBays ??= new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+                    exhaustedBays.Add(candidateRoute.TargetBayId);
+                    continue;
+                }
+
+                var session = new ActiveVehicleSession(
+                    request.VehicleSessionId,
+                    request.VehicleType,
+                    candidateRoute.TargetBayId,
+                    lease.FencingToken,
+                    candidateRoute,
+                    request.StartNodeId,
+                    allocatedAt,
+                    expiresAt);
+
+                _sessions[request.VehicleSessionId] = session;
+                _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
+                _metrics.RecordAllocation();
+                activity?.SetTag("parkmesh.bay_id", candidateRoute.TargetBayId);
+                activity?.SetTag("parkmesh.fencing_token", lease.FencingToken);
+
+                await _ledPublisher.PublishDirectivesAsync(candidateRoute.LedDirectives, ct);
+                await _eventSink.OnBayAllocatedAsync(session, ct);
+                EnqueueAudit(
+                    allocatedAt,
+                    AuditEventType.BayAllocated,
+                    session.AssignedBayId,
+                    session.VehicleSessionId,
+                    session.FencingToken,
+                    session.VehicleType,
+                    request.StartNodeId,
+                    $"cost={candidateRoute.TotalCost:F2}");
+
+                sw.Stop();
+                _logger.LogInformation(
+                    "Allocated bay {BayId} (fence={FencingToken}, cost={Cost:F2}) to session {SessionId} in {ElapsedMs:F2}ms.",
+                    candidateRoute.TargetBayId,
+                    lease.FencingToken,
+                    candidateRoute.TotalCost,
+                    request.VehicleSessionId,
+                    sw.Elapsed.TotalMilliseconds);
+
+                return new AllocateSpotResult(true, session, ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
+            }
+
+            if (!attemptedNewCandidate || (exhaustedBays?.Count ?? 0) >= _graph.BaysById.Count)
+                break;
         }
 
         sw.Stop();
@@ -227,7 +264,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             _congestionTracker.RemoveRouteLoad(removedSession.Route.Steps.Select(s => s.EdgeId));
         }
 
-        _auditSink.TryEnqueue(new ParkingAuditEvent(
+        EnqueueAudit(
             _timeProvider.GetUtcNow(),
             AuditEventType.LeaseReleased,
             bayId,
@@ -235,7 +272,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             fencingToken,
             removedSession?.VehicleType,
             removedSession?.LastKnownNodeId,
-            null));
+            null);
 
         return true;
     }
@@ -265,7 +302,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 _congestionTracker.RemoveRouteLoad(departed.Route.Steps.Select(s => s.EdgeId));
 
             await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Free, ct);
-            _auditSink.TryEnqueue(new ParkingAuditEvent(
+            EnqueueAudit(
                 _timeProvider.GetUtcNow(),
                 AuditEventType.PhysicalVacated,
                 bayId,
@@ -273,7 +310,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 departed?.FencingToken,
                 departed?.VehicleType,
                 departed?.LastKnownNodeId,
-                null));
+                null);
 
             return new PhysicalOccupancyResult(bayId, BayStatus.Free, false, null, null);
         }
@@ -306,7 +343,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         if (!wasIntruder || displacedSession is null)
         {
             await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
-            _auditSink.TryEnqueue(new ParkingAuditEvent(
+            EnqueueAudit(
                 _timeProvider.GetUtcNow(),
                 AuditEventType.PhysicalOccupied,
                 bayId,
@@ -314,14 +351,128 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 null,
                 null,
                 null,
-                null));
+                null);
             return new PhysicalOccupancyResult(bayId, BayStatus.Occupied, false, null, null);
         }
 
+        return await RerouteDisplacedSessionAsync(
+            bayId,
+            BayStatus.Occupied,
+            displacedSession,
+            wasIntruder: true,
+            AuditEventType.IntrusionRerouted,
+            rerouteSuccessDetails: newSession => $"reroutedBay={newSession.AssignedBayId};intruder={occupantSessionId}",
+            rerouteFailureDetails: $"rerouteFailed;intruder={occupantSessionId}",
+            warningReason: "Physical intrusion on leased bay",
+            ct);
+    }
+
+    public async Task<PhysicalOccupancyResult> SetBayMaintenanceAsync(
+        string bayId,
+        bool outOfService,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(bayId);
+
+        if (!_graph.TryGetBay(bayId, out var bay))
+            throw new KeyNotFoundException($"Unknown bay '{bayId}'.");
+
+        if (!outOfService)
+        {
+            var restored = false;
+            BayStatus resultingStatus;
+            lock (_stateLock)
+            {
+                if (bay.Status == BayStatus.OutOfService)
+                {
+                    bay.MarkFree();
+                    restored = true;
+                }
+
+                resultingStatus = bay.Status;
+            }
+
+            if (restored)
+            {
+                await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Free, ct);
+                EnqueueAudit(
+                    _timeProvider.GetUtcNow(),
+                    AuditEventType.BayRestored,
+                    bayId,
+                    null,
+                    null,
+                    null,
+                    null,
+                    "maintenance cleared");
+            }
+
+            return new PhysicalOccupancyResult(bayId, resultingStatus, false, null, null);
+        }
+
+        ActiveVehicleSession? displacedSession = null;
+        var changed = false;
+
+        lock (_stateLock)
+        {
+            if (bay.Status == BayStatus.OutOfService)
+                return new PhysicalOccupancyResult(bayId, BayStatus.OutOfService, false, null, null);
+
+            if (bay.CurrentSessionId is not null)
+                _sessions.TryRemove(bay.CurrentSessionId, out displacedSession);
+
+            bay.MarkOutOfService();
+            changed = true;
+        }
+
+        await _leaseManager.InvalidateLeaseAsync(bayId, ct);
+
+        if (displacedSession is not null)
+        {
+            return await RerouteDisplacedSessionAsync(
+                bayId,
+                BayStatus.OutOfService,
+                displacedSession,
+                wasIntruder: false,
+                AuditEventType.BayOutOfService,
+                rerouteSuccessDetails: newSession => $"maintenance;reroutedBay={newSession.AssignedBayId}",
+                rerouteFailureDetails: "maintenance;rerouteFailed",
+                warningReason: "Maintenance OutOfService on leased bay",
+                ct);
+        }
+
+        if (changed)
+        {
+            await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.OutOfService, ct);
+            EnqueueAudit(
+                _timeProvider.GetUtcNow(),
+                AuditEventType.BayOutOfService,
+                bayId,
+                null,
+                null,
+                null,
+                null,
+                "manual maintenance");
+        }
+
+        return new PhysicalOccupancyResult(bayId, BayStatus.OutOfService, false, null, null);
+    }
+
+    private async Task<PhysicalOccupancyResult> RerouteDisplacedSessionAsync(
+        string bayId,
+        BayStatus resultingBayStatus,
+        ActiveVehicleSession displacedSession,
+        bool wasIntruder,
+        AuditEventType auditEventType,
+        Func<ActiveVehicleSession, string> rerouteSuccessDetails,
+        string rerouteFailureDetails,
+        string warningReason,
+        CancellationToken ct)
+    {
         _congestionTracker.RemoveRouteLoad(displacedSession.Route.Steps.Select(s => s.EdgeId));
 
         _logger.LogWarning(
-            "Physical intrusion on leased bay {BayId}! Displaced session {SessionId}; triggering live reroute from {LastNode}.",
+            "{Reason} {BayId}! Displaced session {SessionId}; triggering live reroute from {LastNode}.",
+            warningReason,
             bayId,
             displacedSession.VehicleSessionId,
             displacedSession.LastKnownNodeId);
@@ -335,22 +486,22 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             ct);
 
         var newSession = rerouteResult.Succeeded ? rerouteResult.Session : null;
-        await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
+        await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, resultingBayStatus, ct);
         await _eventSink.OnRouteReassignedAsync(bayId, displacedSession.VehicleSessionId, newSession, ct);
-        _auditSink.TryEnqueue(new ParkingAuditEvent(
+        EnqueueAudit(
             _timeProvider.GetUtcNow(),
-            AuditEventType.IntrusionRerouted,
+            auditEventType,
             bayId,
             displacedSession.VehicleSessionId,
             newSession?.FencingToken,
             displacedSession.VehicleType,
             displacedSession.LastKnownNodeId,
-            newSession is not null ? $"reroutedBay={newSession.AssignedBayId};intruder={occupantSessionId}" : $"rerouteFailed;intruder={occupantSessionId}"));
+            newSession is not null ? rerouteSuccessDetails(newSession) : rerouteFailureDetails);
 
         return new PhysicalOccupancyResult(
             bayId,
-            BayStatus.Occupied,
-            WasIntruder: true,
+            resultingBayStatus,
+            WasIntruder: wasIntruder,
             DisplacedSessionId: displacedSession.VehicleSessionId,
             ReroutedSession: newSession);
     }
@@ -413,7 +564,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             await _leaseManager.TryReleaseLeaseAsync(purged.AssignedBayId, purged.FencingToken, ct);
             _metrics.RecordLeaseExpired();
             await _eventSink.OnPhysicalOccupancyChangedAsync(purged.AssignedBayId, BayStatus.Free, ct);
-            _auditSink.TryEnqueue(new ParkingAuditEvent(
+            EnqueueAudit(
                 now,
                 AuditEventType.LeaseExpired,
                 purged.AssignedBayId,
@@ -421,7 +572,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 purged.FencingToken,
                 purged.VehicleType,
                 purged.LastKnownNodeId,
-                null));
+                null);
 
             _logger.LogInformation(
                 "Purged expired lease for bay {BayId} (fence={FencingToken}, session={SessionId}).",
@@ -437,5 +588,149 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         }
 
         return expired;
+    }
+
+    public async Task<int> RehydrateStateAsync(CancellationToken ct = default)
+    {
+        var tenantId = _tenantContext.CurrentTenantId;
+        var physicalStates = await _auditStore.GetLatestBayPhysicalStatesAsync(tenantId, ct);
+        var bayIds = _graph.BaysById.Keys.ToArray();
+        var activeLeases = await _leaseManager.GetActiveLeasesAsync(bayIds, ct);
+
+        Dictionary<(string BayId, long Token), ParkingAuditEvent>? allocationAuditByLease = null;
+        if (activeLeases.Count > 0)
+        {
+            var recentEvents = await _auditStore.GetRecentAsync(tenantId, 200, ct);
+            allocationAuditByLease = new Dictionary<(string BayId, long Token), ParkingAuditEvent>();
+            foreach (var ev in recentEvents)
+            {
+                if (ev.EventType == AuditEventType.BayAllocated && ev.FencingToken.HasValue)
+                {
+                    allocationAuditByLease.TryAdd((ev.BayId, ev.FencingToken.Value), ev);
+                }
+            }
+        }
+
+        var defaultGateId = _graph.Gates.FirstOrDefault()?.Id;
+        var precomputedRoutes = new List<(ActiveLeaseSnapshot Lease, ParkingRoute Route, VehicleType VehicleType, string StartNodeId)>(activeLeases.Count);
+
+        foreach (var lease in activeLeases)
+        {
+            if (!_graph.TryGetBay(lease.BayId, out var bay))
+                continue;
+
+            ParkingAuditEvent? allocEvent = null;
+            allocationAuditByLease?.TryGetValue((lease.BayId, lease.FencingToken), out allocEvent);
+
+            var startNodeId = allocEvent?.NodeId is not null && _graph.TryGetNode(allocEvent.NodeId, out _)
+                ? allocEvent.NodeId
+                : defaultGateId ?? bay.NodeId;
+
+            var vehicleType = allocEvent?.VehicleType ?? bay.PrimaryType;
+            var route = _pathfinder.FindShortestPath(_graph, startNodeId, bay.BayId)
+                ?? _pathfinder.FindShortestPath(_graph, bay.NodeId, bay.BayId);
+
+            if (route is null)
+                continue;
+
+            precomputedRoutes.Add((lease, route, vehicleType, startNodeId));
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        var restoredSessions = new List<ActiveVehicleSession>(precomputedRoutes.Count);
+        var restoredCount = 0;
+
+        lock (_stateLock)
+        {
+            foreach (var (bayId, eventType) in physicalStates)
+            {
+                if (!_graph.TryGetBay(bayId, out var bay))
+                    continue;
+
+                switch (eventType)
+                {
+                    case AuditEventType.PhysicalOccupied or AuditEventType.IntrusionRerouted:
+                        if (bay.Status != BayStatus.Occupied)
+                        {
+                            bay.MarkOccupied();
+                            restoredCount++;
+                        }
+                        break;
+
+                    case AuditEventType.BayOutOfService:
+                        if (bay.Status != BayStatus.OutOfService)
+                        {
+                            bay.MarkOutOfService();
+                            restoredCount++;
+                        }
+                        break;
+
+                    case AuditEventType.PhysicalVacated or AuditEventType.BayRestored:
+                        if (bay.Status is BayStatus.Occupied or BayStatus.OutOfService)
+                        {
+                            bay.MarkFree();
+                        }
+                        break;
+                }
+            }
+
+            foreach (var (lease, route, vehicleType, startNodeId) in precomputedRoutes)
+            {
+                if (!_graph.TryGetBay(lease.BayId, out var bay))
+                    continue;
+
+                var expiresAt = now.Add(lease.RemainingTtl is { } ttl && ttl > TimeSpan.Zero ? ttl : DefaultLeaseTtl);
+                if (!bay.TrySetLeased(lease.VehicleSessionId, lease.FencingToken, expiresAt))
+                    continue;
+
+                var session = new ActiveVehicleSession(
+                    lease.VehicleSessionId,
+                    vehicleType,
+                    lease.BayId,
+                    lease.FencingToken,
+                    route,
+                    startNodeId,
+                    now,
+                    expiresAt);
+
+                _sessions[lease.VehicleSessionId] = session;
+                restoredSessions.Add(session);
+                restoredCount++;
+            }
+        }
+
+        foreach (var session in restoredSessions)
+        {
+            _congestionTracker.AddRouteLoad(session.Route.Steps.Select(s => s.EdgeId));
+        }
+
+        _logger.LogInformation(
+            "Rehydrated garage state on startup: {RestoredCount} bay states ({LeaseCount} active leases).",
+            restoredCount,
+            restoredSessions.Count);
+
+        return restoredCount;
+    }
+
+    private void EnqueueAudit(
+        DateTimeOffset occurredAtUtc,
+        AuditEventType eventType,
+        string bayId,
+        string? sessionId,
+        long? fencingToken,
+        VehicleType? vehicleType,
+        string? nodeId,
+        string? details)
+    {
+        _auditSink.TryEnqueue(new ParkingAuditEvent(
+            occurredAtUtc,
+            eventType,
+            bayId,
+            sessionId,
+            fencingToken,
+            vehicleType,
+            nodeId,
+            details,
+            TenantId: _tenantContext.CurrentTenantId));
     }
 }

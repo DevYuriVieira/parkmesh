@@ -91,6 +91,14 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
         Assert.All(results, r => Assert.True(r.Succeeded, r.FailureReason));
         var bayIds = results.Select(r => r.Session!.AssignedBayId).ToList();
         Assert.Equal(40, bayIds.Distinct(StringComparer.OrdinalIgnoreCase).Count());
+
+        var activeLeases = await manager.GetActiveLeasesAsync(graph.BaysById.Keys.ToArray());
+        Assert.Equal(40, activeLeases.Count);
+        Assert.All(activeLeases, lease =>
+        {
+            Assert.True(lease.FencingToken >= 1);
+            Assert.True(lease.RemainingTtl is { } ttl && ttl > TimeSpan.Zero);
+        });
     }
 
     private RedisBayLeaseManager CreateManager(string prefix) =>

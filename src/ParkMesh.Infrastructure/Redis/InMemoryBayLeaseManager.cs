@@ -78,5 +78,37 @@ public sealed class InMemoryBayLeaseManager : IBayLeaseManager
         }
     }
 
+    public Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+        IReadOnlyCollection<string> bayIds,
+        CancellationToken ct = default)
+    {
+        var now = DateTimeOffset.UtcNow;
+        var active = new List<ActiveLeaseSnapshot>();
+
+        lock (_lock)
+        {
+            foreach (var bayId in bayIds)
+            {
+                if (!_leases.TryGetValue(bayId, out var existing))
+                    continue;
+
+                var remaining = existing.ExpiresAtUtc - now;
+                if (remaining <= TimeSpan.Zero)
+                {
+                    _leases.TryRemove(bayId, out _);
+                    continue;
+                }
+
+                active.Add(new ActiveLeaseSnapshot(
+                    bayId,
+                    existing.SessionId,
+                    existing.FencingToken,
+                    remaining));
+            }
+        }
+
+        return Task.FromResult<IReadOnlyList<ActiveLeaseSnapshot>>(active);
+    }
+
     public Task<bool> PingAsync(CancellationToken ct = default) => Task.FromResult(true);
 }

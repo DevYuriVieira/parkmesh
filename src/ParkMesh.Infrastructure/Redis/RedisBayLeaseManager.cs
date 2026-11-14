@@ -103,6 +103,59 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
         return separatorIndex > 0 ? raw[..separatorIndex] : raw;
     }
 
+    public async Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+        IReadOnlyCollection<string> bayIds,
+        CancellationToken ct = default)
+    {
+        if (bayIds.Count == 0)
+            return Array.Empty<ActiveLeaseSnapshot>();
+
+        var db = _redis.GetDatabase();
+        var batch = db.CreateBatch();
+        var bayList = bayIds as string[] ?? bayIds.ToArray();
+        var valueTasks = new Task<RedisValue>[bayList.Length];
+        var ttlTasks = new Task<TimeSpan?>[bayList.Length];
+
+        for (var i = 0; i < bayList.Length; i++)
+        {
+            var leaseKey = BuildLeaseKey(bayList[i]);
+            valueTasks[i] = batch.StringGetAsync(leaseKey);
+            ttlTasks[i] = batch.KeyTimeToLiveAsync(leaseKey);
+        }
+
+        batch.Execute();
+        var values = await Task.WhenAll(valueTasks);
+        var ttls = await Task.WhenAll(ttlTasks);
+        var active = new List<ActiveLeaseSnapshot>();
+
+        for (var i = 0; i < bayList.Length; i++)
+        {
+            var rawValue = values[i];
+            if (rawValue.IsNullOrEmpty)
+                continue;
+
+            var raw = rawValue.ToString();
+            var separatorIndex = raw.LastIndexOf(':');
+            if (separatorIndex <= 0 ||
+                !long.TryParse(raw.AsSpan(separatorIndex + 1), out var fencingToken))
+            {
+                continue;
+            }
+
+            var remainingTtl = ttls[i];
+            if (remainingTtl is { } ttl && ttl <= TimeSpan.Zero)
+                continue;
+
+            active.Add(new ActiveLeaseSnapshot(
+                bayList[i],
+                raw[..separatorIndex],
+                fencingToken,
+                remainingTtl));
+        }
+
+        return active;
+    }
+
     public async Task<bool> PingAsync(CancellationToken ct = default)
     {
         try

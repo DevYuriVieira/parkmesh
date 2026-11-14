@@ -6,6 +6,12 @@ public sealed record LeaseAcquireResult(
     DateTimeOffset? ExpiresAtUtc,
     string? FailureReason = null);
 
+public sealed record ActiveLeaseSnapshot(
+    string BayId,
+    string VehicleSessionId,
+    long FencingToken,
+    TimeSpan? RemainingTtl = null);
+
 public interface IBayLeaseManager
 {
     Task<LeaseAcquireResult> TryAcquireLeaseAsync(
@@ -26,6 +32,11 @@ public interface IBayLeaseManager
     Task<string?> GetActiveLeaseHolderAsync(
         string bayId,
         CancellationToken ct = default);
+
+    Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+        IReadOnlyCollection<string> bayIds,
+        CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ActiveLeaseSnapshot>>(Array.Empty<ActiveLeaseSnapshot>());
 
     Task<bool> PingAsync(CancellationToken ct = default) => Task.FromResult(true);
 }

@@ -90,6 +90,47 @@ public sealed class AStarPathfinderTests
         });
     }
 
+    [Fact]
+    public void FindCandidateBayRoutes_MatchesExactGlobalDijkstraRanking_AcrossCongestionAndFallbackBays()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var pathfinder = new AStarPathfinder();
+        var rng = new Random(99);
+
+        var congestion = graph.Edges.ToDictionary(
+            e => e.Id,
+            _ => rng.NextDouble() * 40.0,
+            StringComparer.OrdinalIgnoreCase);
+
+        foreach (var bay in graph.BaysById.Values.Where(b => b.PrimaryType == VehicleType.EV).Take(6))
+        {
+            bay.MarkOccupied("OCCUPIED-TEST");
+        }
+
+        var expectedDist = ComputeDijkstraDistances(graph, "GATE-N1", congestion);
+        var expectedTop5 = graph.BaysById.Values
+            .Where(b => b.Status == BayStatus.Free && b.SupportsVehicle(VehicleType.EV))
+            .Select(b =>
+            {
+                var totalCost = expectedDist[b.NodeId];
+                var score = totalCost + (b.PrimaryType == VehicleType.EV ? 0.0 : 100.0);
+                return (b.BayId, TotalCost: totalCost, Score: score);
+            })
+            .OrderBy(x => x.Score)
+            .ThenBy(x => x.BayId, StringComparer.OrdinalIgnoreCase)
+            .Take(5)
+            .ToArray();
+
+        var actualTop5 = pathfinder.FindCandidateBayRoutes(graph, "GATE-N1", VehicleType.EV, congestion, maxCandidates: 5);
+
+        Assert.Equal(expectedTop5.Length, actualTop5.Count);
+        for (var i = 0; i < expectedTop5.Length; i++)
+        {
+            Assert.Equal(expectedTop5[i].BayId, actualTop5[i].TargetBayId);
+            Assert.Equal(expectedTop5[i].TotalCost, actualTop5[i].TotalCost, precision: 6);
+        }
+    }
+
     private static Dictionary<string, double> ComputeDijkstraDistances(
         ParkingGraph graph,
         string startNodeId,

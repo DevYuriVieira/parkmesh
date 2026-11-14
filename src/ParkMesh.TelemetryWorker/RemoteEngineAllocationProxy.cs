@@ -98,6 +98,22 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
         return result ?? new PhysicalOccupancyResult(bayId, occupied ? BayStatus.Occupied : BayStatus.Free, false, null, null);
     }
 
+    public async Task<PhysicalOccupancyResult> SetBayMaintenanceAsync(
+        string bayId,
+        bool outOfService,
+        CancellationToken ct = default)
+    {
+        var response = await _httpClient.PatchAsJsonAsync(
+            $"api/parking/bays/{bayId}/maintenance",
+            new { OutOfService = outOfService },
+            JsonOptions,
+            ct);
+
+        response.EnsureSuccessStatusCode();
+        var result = await response.Content.ReadFromJsonAsync<PhysicalOccupancyResult>(JsonOptions, ct);
+        return result ?? new PhysicalOccupancyResult(bayId, outOfService ? BayStatus.OutOfService : BayStatus.Free, false, null, null);
+    }
+
     public bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId) => false;
 
     public ValueTask<bool> UpdateVehicleProgressAsync(string vehicleSessionId, string currentNodeId, CancellationToken ct = default) =>
@@ -107,6 +123,9 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
 
     public Task<IReadOnlyList<ExpiredLeaseInfo>> PurgeExpiredSessionsAsync(CancellationToken ct = default) =>
         Task.FromResult<IReadOnlyList<ExpiredLeaseInfo>>(Array.Empty<ExpiredLeaseInfo>());
+
+    public Task<int> RehydrateStateAsync(CancellationToken ct = default) =>
+        Task.FromResult(0);
 
     public void Dispose() => _httpClient.Dispose();
 

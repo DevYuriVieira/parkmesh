@@ -1,5 +1,6 @@
 using System.Text.Json.Serialization;
 using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Diagnostics;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.FileProviders;
@@ -55,6 +56,8 @@ builder.Services.ConfigureHttpJsonOptions(options =>
     options.SerializerOptions.Converters.Add(new JsonStringEnumConverter());
 });
 
+builder.Services.AddOpenApi();
+
 builder.Services
     .AddSignalR()
     .AddJsonProtocol(options =>
@@ -68,6 +71,8 @@ builder.Services.AddParkMeshTelemetry(builder.Configuration);
 
 builder.Services.AddSingleton<SignalRParkingEventSink>();
 builder.Services.AddSingleton<IParkingEventSink>(sp => sp.GetRequiredService<SignalRParkingEventSink>());
+builder.Services.AddSingleton<IStateHydrationTracker, StateHydrationTracker>();
+builder.Services.AddHostedService<GarageStateHydrationHostedService>();
 builder.Services.AddHostedService<MetricsBroadcastHostedService>();
 builder.Services.AddHostedService<LeaseExpirationSweeperHostedService>();
 
@@ -98,8 +103,30 @@ builder.Services
 
 var app = builder.Build();
 
+app.UseMiddleware<SecurityHeadersMiddleware>();
+app.UseExceptionHandler(errorApp =>
+{
+    errorApp.Run(async context =>
+    {
+        var exception = context.Features.Get<IExceptionHandlerFeature>()?.Error;
+        var (statusCode, message) = exception switch
+        {
+            BadHttpRequestException { StatusCode: StatusCodes.Status413PayloadTooLarge } =>
+                (StatusCodes.Status413PayloadTooLarge, "Request payload exceeds the configured size limit."),
+            BadHttpRequestException badReq =>
+                (badReq.StatusCode, "Malformed HTTP request payload."),
+            _ => (StatusCodes.Status500InternalServerError, "An unexpected error occurred.")
+        };
+
+        context.Response.StatusCode = statusCode;
+        context.Response.ContentType = "application/json";
+        await context.Response.WriteAsJsonAsync(new { error = message });
+    });
+});
+app.UseMiddleware<TenantResolutionMiddleware>();
 app.UseRateLimiter();
 app.UseOpenTelemetryPrometheusScrapingEndpoint();
+app.MapOpenApi();
 
 var webRoot = ResolveWebDirectory(app.Environment.ContentRootPath);
 if (webRoot is not null)
@@ -116,19 +143,24 @@ app.MapGet("/health/live", () => Results.Ok(new { status = "live", service = "Pa
 app.MapGet("/health/ready", async (
     IBayLeaseManager leaseManager,
     IParkingAuditStore auditStore,
+    IStateHydrationTracker hydrationTracker,
     CancellationToken ct) =>
 {
     var leaseHealthy = await leaseManager.PingAsync(ct);
     var auditHealthy = await auditStore.CheckConnectivityAsync(ct);
-    var ready = leaseHealthy && auditHealthy;
+    var hydrated = hydrationTracker.IsHydrated;
+    var ready = leaseHealthy && auditHealthy && hydrated;
 
     var payload = new
     {
         status = ready ? "ready" : "degraded",
+        hydrated,
+        restoredStates = hydrationTracker.RestoredStateCount,
         dependencies = new
         {
             leaseStore = leaseHealthy ? "healthy" : "unhealthy",
-            auditStore = auditHealthy ? "healthy" : "unhealthy"
+            auditStore = auditHealthy ? "healthy" : "unhealthy",
+            stateHydration = hydrated ? "hydrated" : (hydrationTracker.LastError ?? "hydrating")
         }
     };
 
@@ -174,16 +206,19 @@ app.MapGet("/api/parking/audit", async (
     [FromQuery] int? limit,
     IParkingAuditStore auditStore,
     IParkingAuditSink auditSink,
+    ITenantContext tenantContext,
     CancellationToken ct) =>
 {
-    var items = await auditStore.GetRecentAsync(limit ?? 50, ct);
+    var tenantId = tenantContext.CurrentTenantId;
+    var items = await auditStore.GetRecentAsync(tenantId, limit ?? 50, ct);
     return Results.Ok(new
     {
+        tenantId,
         count = items.Count,
         droppedCount = auditSink.DroppedCount,
         events = items
     });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/bays", (
     IParkingAllocationService allocationService,
@@ -248,7 +283,7 @@ app.MapPost("/api/parking/allocations", async (
             result.Session,
             result.ComputationTimeMs
         });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapDelete("/api/parking/allocations/{bayId}", async (
     string bayId,
@@ -258,7 +293,7 @@ app.MapDelete("/api/parking/allocations/{bayId}", async (
 {
     var released = await allocationService.ReleaseLeaseAsync(bayId, fencingToken, ct);
     return released ? Results.NoContent() : Results.Conflict(new { error = "Invalid or expired fencing token." });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapPost("/api/parking/bays/{bayId}/occupancy", async (
     string bayId,
@@ -274,6 +309,23 @@ app.MapPost("/api/parking/bays/{bayId}/occupancy", async (
             request.OccupantSessionId,
             ct);
 
+        return Results.Ok(result);
+    }
+    catch (KeyNotFoundException)
+    {
+        return Results.NotFound(new { error = $"Bay '{bayId}' not found." });
+    }
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
+
+app.MapPatch("/api/parking/bays/{bayId}/maintenance", async (
+    string bayId,
+    MaintenanceApiRequest request,
+    IParkingAllocationService allocationService,
+    CancellationToken ct) =>
+{
+    try
+    {
+        var result = await allocationService.SetBayMaintenanceAsync(bayId, request.OutOfService, ct);
         return Results.Ok(result);
     }
     catch (KeyNotFoundException)
@@ -352,8 +404,8 @@ var chaosBurstEndpoint = app.MapPost("/api/parking/chaos/burst", async (
     });
 });
 
-chaosIntruderEndpoint.RequireRateLimiting("chaos");
-chaosBurstEndpoint.RequireRateLimiting("chaos");
+chaosIntruderEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
+chaosBurstEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapHub<ParkingHub>("/hubs/parking");
 
@@ -378,6 +430,8 @@ public sealed record AllocateSpotApiRequest(
 public sealed record PhysicalOccupancyApiRequest(
     bool Occupied,
     string? OccupantSessionId = null);
+
+public sealed record MaintenanceApiRequest(bool OutOfService);
 
 public sealed record VehicleProgressApiRequest(string CurrentNodeId);
 
