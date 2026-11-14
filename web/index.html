@@ -1,0 +1,110 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ParkMesh — Real-Time Smart Parking Engine</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">PM</div>
+      <div>
+        <h1>ParkMesh</h1>
+        <p class="subtitle">Multi-Floor A* Routing · Redis Fencing Leases · IoT Telemetry</p>
+      </div>
+    </div>
+
+    <div class="floor-tabs" id="floorTabs">
+      <button class="floor-tab active" data-floor="0">Ground (F0) <span class="badge" id="floorBadge0">--</span></button>
+      <button class="floor-tab" data-floor="1">Level G1 (F1) <span class="badge" id="floorBadge1">--</span></button>
+      <button class="floor-tab" data-floor="2">Level G2 (F2) <span class="badge" id="floorBadge2">--</span></button>
+    </div>
+
+    <div class="connection-status">
+      <span class="dot" id="connDot"></span>
+      <span id="connLabel">Connecting...</span>
+    </div>
+  </header>
+
+  <main class="workspace">
+    <section class="canvas-panel">
+      <div class="canvas-toolbar">
+        <div class="legend">
+          <span class="legend-item"><i class="swatch free"></i>Free</span>
+          <span class="legend-item"><i class="swatch leased"></i>Leased (90s)</span>
+          <span class="legend-item"><i class="swatch occupied"></i>Occupied</span>
+          <span class="legend-item"><i class="swatch car"></i>Active Vehicle</span>
+          <span class="legend-item"><i class="swatch led"></i>LED Panel</span>
+        </div>
+        <span class="canvas-hint" id="canvasFloorTitle">Viewing Floor 0 — 40 Bays · 2 Entry Gates</span>
+      </div>
+      <div class="canvas-wrap">
+        <canvas id="garageCanvas"></canvas>
+      </div>
+    </section>
+
+    <aside class="sidebar">
+      <section class="card">
+        <h2>Live Chaos &amp; Traffic Controls</h2>
+        <div class="control-row">
+          <select id="gateSelect">
+            <option value="GATE-N1">GATE-N1 (North)</option>
+            <option value="GATE-S1">GATE-S1 (South)</option>
+          </select>
+          <select id="vehicleTypeSelect">
+            <option value="Standard">Standard</option>
+            <option value="EV">EV (Electric)</option>
+            <option value="SUV">SUV</option>
+            <option value="Pcd">PCD</option>
+            <option value="Moto">Moto</option>
+          </select>
+        </div>
+        <div class="button-grid">
+          <button class="btn primary" id="spawnBtn">Spawn Vehicle</button>
+          <button class="btn danger" id="intruderBtn">Inject Intruder</button>
+          <button class="btn accent" id="burstBtn">Entry Burst (25)</button>
+          <button class="btn toggle" id="demoToggleBtn">Auto-Demo: OFF</button>
+        </div>
+      </section>
+
+      <section class="card">
+        <h2>Real-Time Engine Metrics</h2>
+        <div class="kpi-grid">
+          <div class="kpi">
+            <span class="kpi-label">Occupancy</span>
+            <strong class="kpi-value" id="kpiOccupancy">0%</strong>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Active Cars</span>
+            <strong class="kpi-value" id="kpiActive">0</strong>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Reroutes</span>
+            <strong class="kpi-value warn" id="kpiReroutes">0</strong>
+          </div>
+          <div class="kpi">
+            <span class="kpi-label">Contention</span>
+            <strong class="kpi-value" id="kpiContention">0</strong>
+          </div>
+        </div>
+
+        <div class="latency-table">
+          <div><span>A* P50 / P95 / P99</span><strong id="astarLatency">0 / 0 / 0 ms</strong></div>
+          <div><span>Redis Lease P50 / P95</span><strong id="redisLatency">0 / 0 ms</strong></div>
+          <div><span>MQTT Channel (Enq / Conf)</span><strong id="channelStats">0 / 0</strong></div>
+          <div><span>Bay States (F / L / O)</span><strong id="bayCounts">120 / 0 / 0</strong></div>
+        </div>
+      </section>
+
+      <section class="card feed-card">
+        <h2>Live Domain Event Stream</h2>
+        <ul class="event-feed" id="eventFeed"></ul>
+      </section>
+    </aside>
+  </main>
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>
