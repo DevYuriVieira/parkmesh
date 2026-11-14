@@ -22,9 +22,23 @@
       <button class="floor-tab" data-floor="2">Level G2 (F2) <span class="badge" id="floorBadge2">--</span></button>
     </div>
 
-    <div class="connection-status">
-      <span class="dot" id="connDot"></span>
-      <span id="connLabel">Connecting...</span>
+    <div class="topbar-controls">
+      <div class="tenant-control">
+        <label for="tenantSelect">Tenant</label>
+        <select id="tenantSelect" aria-label="Active tenant selector">
+          <option value="default">default</option>
+          <option value="garage-sp-01">garage-sp-01</option>
+          <option value="garage-rj-02">garage-rj-02</option>
+          <option value="__custom__">Custom...</option>
+        </select>
+        <input id="customTenantInput" type="text" maxlength="64" placeholder="tenant-id" class="hidden" aria-label="Custom tenant identifier" />
+        <button id="applyTenantBtn" type="button" class="btn toggle small hidden">Apply</button>
+      </div>
+
+      <div class="connection-status">
+        <span class="dot" id="connDot"></span>
+        <span id="connLabel">Connecting...</span>
+      </div>
     </div>
   </header>
 
@@ -106,7 +120,7 @@
 
       <details class="card audit-card" id="auditDrawer">
         <summary class="audit-summary">
-          <span>Durable Audit Log <span class="badge" id="auditCountBadge">0</span></span>
+          <span>Durable Audit Log (<span id="auditTenantLabel">default</span>) <span class="badge" id="auditCountBadge">0</span></span>
           <span class="audit-meta" id="auditDroppedLabel">dropped: 0</span>
         </summary>
         <div class="audit-toolbar">

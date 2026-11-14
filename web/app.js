@@ -1,6 +1,7 @@
 import { SignalRLiteClient } from "./signalr-lite.js";
 
 const state = {
+  tenantId: "default",
   selectedFloor: 0,
   nodesById: new Map(),
   edges: [],
@@ -14,6 +15,14 @@ const state = {
   demoCounter: 1,
   hoveredBayId: null
 };
+
+const TENANT_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+function apiFetch(url, options = {}) {
+  const headers = new Headers(options.headers || {});
+  headers.set("X-Tenant-Id", state.tenantId);
+  return fetch(url, { ...options, headers });
+}
 
 const canvas = document.getElementById("garageCanvas");
 const ctx = canvas.getContext("2d");
@@ -411,25 +420,37 @@ async function spawnVehicle() {
   const vehicleType = document.getElementById("vehicleTypeSelect").value;
   const sessionId = `CAR-${String(state.demoCounter++).padStart(4, "0")}`;
 
-  await fetch("/api/parking/allocations", {
+  const res = await apiFetch("/api/parking/allocations", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ gateId, vehicleSessionId: sessionId, vehicleType, leaseSeconds: 90 })
   });
+  if (!res.ok) {
+    logEvent(`Allocation rejected (${res.status}) for tenant ${state.tenantId}.`, "occupied");
+  } else if (document.getElementById("auditDrawer").open) {
+    await loadAuditEvents();
+  }
 }
 
 async function injectIntruder() {
-  const res = await fetch("/api/parking/chaos/intruder", { method: "POST" });
+  const res = await apiFetch("/api/parking/chaos/intruder", { method: "POST" });
   if (!res.ok) {
-    logEvent("No active leased bay to inject intruder into.", "occupied");
+    logEvent(`No active leased bay for tenant ${state.tenantId} to inject intruder into.`, "occupied");
+  } else if (document.getElementById("auditDrawer").open) {
+    await loadAuditEvents();
   }
 }
 
 async function triggerBurst() {
-  const res = await fetch("/api/parking/chaos/burst?count=25", { method: "POST" });
+  const res = await apiFetch("/api/parking/chaos/burst?count=25", { method: "POST" });
   if (res.ok) {
     const data = await res.json();
-    logEvent(`Burst completed: ${data.succeeded}/${data.requested} cars allocated concurrently.`, "assigned");
+    logEvent(`Burst [${state.tenantId}]: ${data.succeeded}/${data.requested} cars allocated concurrently.`, "assigned");
+    if (document.getElementById("auditDrawer").open) {
+      await loadAuditEvents();
+    }
+  } else {
+    logEvent(`Burst rejected (${res.status}) for tenant ${state.tenantId}.`, "occupied");
   }
 }
 
@@ -442,7 +463,7 @@ async function stepBrowserDemo() {
     const gateId = gates[Math.floor(Math.random() * gates.length)];
     const vehicleType = types[Math.floor(Math.random() * types.length)];
     const sessionId = `DEMO-${String(state.demoCounter++).padStart(4, "0")}`;
-    await fetch("/api/parking/allocations", {
+    await apiFetch("/api/parking/allocations", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ gateId, vehicleSessionId: sessionId, vehicleType, leaseSeconds: 90 })
@@ -454,14 +475,14 @@ async function stepBrowserDemo() {
     if (session.stepCursor < nodes.length - 1) {
       session.stepCursor++;
       const nodeId = nodes[session.stepCursor];
-      await fetch(`/api/parking/sessions/${encodeURIComponent(session.vehicleSessionId)}/progress`, {
+      await apiFetch(`/api/parking/sessions/${encodeURIComponent(session.vehicleSessionId)}/progress`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ currentNodeId: nodeId })
       });
 
       if (session.stepCursor >= nodes.length - 1) {
-        await fetch(`/api/parking/bays/${encodeURIComponent(session.assignedBayId)}/occupancy`, {
+        await apiFetch(`/api/parking/bays/${encodeURIComponent(session.assignedBayId)}/occupancy`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ occupied: true, occupantSessionId: session.vehicleSessionId })
@@ -474,7 +495,7 @@ async function stepBrowserDemo() {
   const occupiedBays = Array.from(state.baysById.values()).filter((b) => b.status === "Occupied");
   if (occupiedBays.length > 0 && Math.random() < 0.18) {
     const leaving = occupiedBays[Math.floor(Math.random() * occupiedBays.length)];
-    await fetch(`/api/parking/bays/${encodeURIComponent(leaving.bayId)}/occupancy`, {
+    await apiFetch(`/api/parking/bays/${encodeURIComponent(leaving.bayId)}/occupancy`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ occupied: false })
@@ -482,7 +503,7 @@ async function stepBrowserDemo() {
   }
 
   if (state.sessions.size >= 2 && Math.random() < 0.12) {
-    await fetch("/api/parking/chaos/intruder", { method: "POST" });
+    await apiFetch("/api/parking/chaos/intruder", { method: "POST" });
   }
 }
 
@@ -510,10 +531,15 @@ function updateFloorHint(hoveredBay = null) {
 }
 
 async function loadAuditEvents() {
-  const res = await fetch("/api/parking/audit?limit=25");
-  if (!res.ok) return;
+  document.getElementById("auditTenantLabel").textContent = state.tenantId;
+  const res = await apiFetch("/api/parking/audit?limit=25");
+  if (!res.ok) {
+    logEvent(`Audit request rejected (${res.status}) for tenant ${state.tenantId}.`, "occupied");
+    return;
+  }
 
   const data = await res.json();
+  document.getElementById("auditTenantLabel").textContent = data.tenantId ?? state.tenantId;
   document.getElementById("auditCountBadge").textContent = String(data.count ?? 0);
   document.getElementById("auditDroppedLabel").textContent = `dropped: ${data.droppedCount ?? 0}`;
 
@@ -534,7 +560,7 @@ async function loadAuditEvents() {
 
 async function toggleBayMaintenance(bay) {
   const outOfService = bay.status !== "OutOfService";
-  const res = await fetch(`/api/parking/bays/${encodeURIComponent(bay.bayId)}/maintenance`, {
+  const res = await apiFetch(`/api/parking/bays/${encodeURIComponent(bay.bayId)}/maintenance`, {
     method: "PATCH",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ outOfService })
@@ -598,11 +624,58 @@ demoBtn.addEventListener("click", () => {
   }
 });
 
+const tenantSelect = document.getElementById("tenantSelect");
+const customTenantInput = document.getElementById("customTenantInput");
+const applyTenantBtn = document.getElementById("applyTenantBtn");
+
+async function setActiveTenant(nextTenant) {
+  if (!TENANT_REGEX.test(nextTenant)) {
+    logEvent(`Invalid tenant ID '${nextTenant}' (must match ^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$).`, "occupied");
+    return;
+  }
+
+  state.tenantId = nextTenant;
+  document.getElementById("auditTenantLabel").textContent = nextTenant;
+  logEvent(`Active tenant switched -> ${nextTenant}`, "assigned");
+
+  const snapRes = await apiFetch("/api/parking/snapshot");
+  if (snapRes.ok) {
+    applySnapshot(await snapRes.json());
+  } else {
+    logEvent(`Tenant '${nextTenant}' rejected (${snapRes.status}).`, "occupied");
+  }
+
+  if (auditDrawer.open) {
+    await loadAuditEvents();
+  }
+}
+
+tenantSelect.addEventListener("change", () => {
+  const isCustom = tenantSelect.value === "__custom__";
+  customTenantInput.classList.toggle("hidden", !isCustom);
+  applyTenantBtn.classList.toggle("hidden", !isCustom);
+  if (!isCustom) {
+    setActiveTenant(tenantSelect.value).catch(console.error);
+  } else {
+    customTenantInput.focus();
+  }
+});
+
+applyTenantBtn.addEventListener("click", () => {
+  setActiveTenant(customTenantInput.value.trim()).catch(console.error);
+});
+
+customTenantInput.addEventListener("keydown", (e) => {
+  if (e.key === "Enter") {
+    setActiveTenant(customTenantInput.value.trim()).catch(console.error);
+  }
+});
+
 async function bootstrap() {
   resizeCanvas();
   window.addEventListener("resize", resizeCanvas);
 
-  const res = await fetch("/api/parking/snapshot");
+  const res = await apiFetch("/api/parking/snapshot");
   if (res.ok) {
     applySnapshot(await res.json());
   }

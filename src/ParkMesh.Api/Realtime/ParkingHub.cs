@@ -1,4 +1,5 @@
 using Microsoft.AspNetCore.SignalR;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Application.Telemetry;
 
@@ -33,7 +34,8 @@ public static class SnapshotBuilder
         IParkingAllocationService allocationService,
         IEngineMetricsRecorder metrics,
         ITelemetryIngestionChannel telemetryChannel,
-        SignalRParkingEventSink eventSink)
+        SignalRParkingEventSink eventSink,
+        string tenantId = TenantDefaults.DefaultTenantId)
     {
         var graph = allocationService.Graph;
         var sessions = allocationService.GetActiveSessions();
@@ -41,6 +43,7 @@ public static class SnapshotBuilder
 
         return new
         {
+            tenantId,
             floors = graph.MaxFloor - graph.MinFloor + 1,
             minFloor = graph.MinFloor,
             maxFloor = graph.MaxFloor,

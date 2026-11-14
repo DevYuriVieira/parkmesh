@@ -6,8 +6,8 @@ Smart parking routing and bay allocation engine written in .NET 10 (C# 14). It m
 
 - `ParkMesh.Domain`: 3-floor (`0..2`), 120-bay graph model with directional lanes, helical ramps, LED directional panels, and vehicle type constraints (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
 - `ParkMesh.Application`: Cached dense-index topology (`ConditionalWeakTable`), `ArrayPool<T>` and `[ThreadStatic]` scratch-pooled single-pass multi-target search with early-exit cutoff, idempotent session retry handling (`409 Conflict` on mismatched parameters), multi-round contention replanning under parallel arrivals, intrusion rerouting, maintenance toggles (`OutOfService`), bounded telemetry debounce (`SensorReadingFilter`), and async tenant context (`ITenantContext`).
-- `ParkMesh.Infrastructure`: Atomic Redis Lua bay leases (`LuaScripts.AcquireBayLease`) with automatic in-memory fallback when `ConnectionStrings:Redis` is unset, MQTTnet ingestion worker, and bounded channel audit outbox (`AuditChannelSink`) with full shutdown batch draining into PostgreSQL (`PostgresParkingAuditStore`) enforcing `ENABLE`/`FORCE ROW LEVEL SECURITY` (`set_config('app.current_tenant', ..., true)` and optional `Postgres:AppRole` via `SET LOCAL ROLE`) or `InMemoryParkingAuditStore` locally.
-- `ParkMesh.Api`: Minimal APIs, `/hubs/parking` SignalR stream, Prometheus `/metrics`, OpenAPI spec (`/openapi/v1.json`), startup state hydration gating `/health/ready`, SHA-256 constant-time `X-Api-Key` verification, `X-Tenant-Id` validation and optional allowlisting (`Security:AllowedTenants`), security response headers, chaos rate limiting, lease expiration sweeper, and static dashboard hosting (`web/`).
+- `ParkMesh.Infrastructure`: Tenant-scoped Redis Lua bay leases (`LuaScripts.AcquireBayLease`) and in-memory fallback (`ITenantContext`), MQTTnet ingestion worker, and bounded channel audit outbox (`AuditChannelSink`) with full shutdown batch draining into PostgreSQL (`PostgresParkingAuditStore`) enforcing `ENABLE`/`FORCE ROW LEVEL SECURITY` (`set_config('app.current_tenant', ..., true)` and optional `Postgres:AppRole` via `SET LOCAL ROLE`) or `InMemoryParkingAuditStore` locally.
+- `ParkMesh.Api`: Minimal APIs, `/hubs/parking` SignalR stream, Prometheus `/metrics`, OpenAPI spec (`/openapi/v1.json`), multi-tenant startup state hydration gating `/health/ready`, SHA-256 constant-time `X-Api-Key` verification, `X-Tenant-Id` validation and optional allowlisting (`Security:AllowedTenants`), security response headers, chaos rate limiting, tenant-attributed lease expiration sweeper, and static dashboard hosting with a live tenant switcher (`web/`).
 - `ParkMesh.TelemetryWorker` & `ParkMesh.Simulator`: Standalone MQTT simulator (noisy sensors, intrusions, fleet arrivals) and worker forwarding confirmed physical state transitions to the API.
 
 ## Repository Layout
@@ -17,7 +17,9 @@ ParkMesh.sln
 Directory.Build.props
 infra/
   docker-compose.yml              # Redis, PostgreSQL, Mosquitto (+ app/prometheus/grafana profiles)
+  k6/load-test.js                 # k6 multi-tenant HTTP load script
   mosquitto/mosquitto.conf
+  postgres/init-rls.sql           # Non-superuser parkmesh_app NOBYPASSRLS role provisioning
 src/
   ParkMesh.Domain/
   ParkMesh.Application/
@@ -87,8 +89,14 @@ dotnet test tests/ParkMesh.IntegrationTests --filter "FullyQualifiedName!~Postgr
 # Full integration suite including Testcontainers Redis and PostgreSQL RLS tests (requires Docker)
 dotnet test tests/ParkMesh.IntegrationTests
 
-# BenchmarkDotNet suite
+# BenchmarkDotNet microbenchmarks
 dotnet run --project benchmarks/ParkMesh.Benchmarks -c Release -- --filter *
+
+# Concurrent HTTP + SignalR load harness (in-process, or pass --baseUrl http://localhost:5150)
+dotnet run --project benchmarks/ParkMesh.Benchmarks -c Release -- --load --concurrency 16 --requests 300
+
+# Optional k6 load test against a running stack
+k6 run infra/k6/load-test.js
 ```
 
 Microbenchmark numbers (`BenchmarkDotNet v0.15.8`, `.NET 10.0.11`, in-process short run):

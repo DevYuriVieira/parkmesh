@@ -1,9 +1,11 @@
 using Microsoft.Extensions.Logging.Abstractions;
 using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Routing;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
+using ParkMesh.Infrastructure.Audit;
 using ParkMesh.Infrastructure.Redis;
 
 namespace ParkMesh.UnitTests;
@@ -232,6 +234,124 @@ public sealed class DomainAndAllocationEdgeTests
         Assert.Contains("already has an active lease", conflict.FailureReason);
         Assert.Contains(first.Session.AssignedBayId, conflict.FailureReason);
         Assert.Single(service.GetActiveSessions());
+    }
+
+    [Fact]
+    public async Task MultiTenantLeasesAndExpiration_IsolateSameSessionIdAndAttributeExpiredAudit()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var tenantContext = new AsyncLocalTenantContext();
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 11, 14, 12, 0, 0, TimeSpan.Zero));
+        var leaseManager = new InMemoryBayLeaseManager(tenantContext, clock);
+        var auditSink = new AuditChannelSink(128);
+        var auditStore = new InMemoryParkingAuditStore();
+
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            leaseManager,
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance,
+            timeProvider: clock,
+            auditSink: auditSink,
+            auditStore: auditStore,
+            tenantContext: tenantContext);
+
+        AllocateSpotResult alphaRes;
+        using (tenantContext.BeginScope("tenant-alpha"))
+        {
+            alphaRes = await service.AllocateAsync(
+                new AllocateSpotRequest("GATE-N1", "SHARED-VIP-01", VehicleType.Standard, TimeSpan.FromSeconds(10)));
+        }
+
+        AllocateSpotResult betaRes;
+        using (tenantContext.BeginScope("tenant-beta"))
+        {
+            betaRes = await service.AllocateAsync(
+                new AllocateSpotRequest("GATE-S1", "SHARED-VIP-01", VehicleType.EV, TimeSpan.FromSeconds(60)));
+        }
+
+        Assert.True(alphaRes.Succeeded);
+        Assert.True(betaRes.Succeeded);
+        Assert.Equal("tenant-alpha", alphaRes.Session!.TenantId);
+        Assert.Equal("tenant-beta", betaRes.Session!.TenantId);
+        Assert.NotEqual(alphaRes.Session.AssignedBayId, betaRes.Session.AssignedBayId);
+        Assert.Single(service.GetActiveSessions("tenant-alpha"));
+        Assert.Single(service.GetActiveSessions("tenant-beta"));
+        Assert.Equal(2, service.GetActiveSessions().Count);
+
+        // Cross-tenant release attempt must be rejected
+        using (tenantContext.BeginScope("tenant-beta"))
+        {
+            Assert.False(await service.ReleaseLeaseAsync(alphaRes.Session.AssignedBayId, alphaRes.Session.FencingToken));
+        }
+
+        // Advance clock by 15s (under default scope) so tenant-alpha lease expires and attributes audit to tenant-alpha
+        clock.Advance(TimeSpan.FromSeconds(15));
+        var expired = await service.PurgeExpiredSessionsAsync();
+        Assert.Single(expired);
+        Assert.Equal(alphaRes.Session.AssignedBayId, expired[0].BayId);
+
+        Assert.Empty(service.GetActiveSessions("tenant-alpha"));
+        Assert.Single(service.GetActiveSessions("tenant-beta"));
+
+        var drained = new List<ParkingAuditEvent>();
+        while (auditSink.TryRead(out var ev))
+        {
+            drained.Add(ev);
+        }
+
+        Assert.Contains(drained, e => e.EventType == AuditEventType.LeaseExpired && e.TenantId == "tenant-alpha" && e.BayId == alphaRes.Session.AssignedBayId);
+        Assert.DoesNotContain(drained, e => e.EventType == AuditEventType.LeaseExpired && e.TenantId != "tenant-alpha");
+    }
+
+    [Fact]
+    public async Task RehydrateStateAsync_AcrossMultipleTenants_RestoresLeasesWithTenantOwnership()
+    {
+        var tenantContext = new AsyncLocalTenantContext();
+        var leaseManager = new InMemoryBayLeaseManager(tenantContext);
+        var auditStore = new InMemoryParkingAuditStore();
+
+        using (tenantContext.BeginScope("tenant-alpha"))
+        {
+            var leaseA = await leaseManager.TryAcquireLeaseAsync("F0-B03", "REHY-A", TimeSpan.FromMinutes(2));
+            await auditStore.RecordBatchAsync(
+            [
+                new ParkingAuditEvent(DateTimeOffset.UtcNow, AuditEventType.BayAllocated, "F0-B03", "REHY-A", leaseA.FencingToken, VehicleType.Standard, "GATE-N1", null, TenantId: "tenant-alpha")
+            ]);
+        }
+
+        using (tenantContext.BeginScope("tenant-beta"))
+        {
+            var leaseB = await leaseManager.TryAcquireLeaseAsync("F1-B12", "REHY-B", TimeSpan.FromMinutes(2));
+            await auditStore.RecordBatchAsync(
+            [
+                new ParkingAuditEvent(DateTimeOffset.UtcNow, AuditEventType.BayAllocated, "F1-B12", "REHY-B", leaseB.FencingToken, VehicleType.EV, "GATE-S1", null, TenantId: "tenant-beta")
+            ]);
+        }
+
+        var freshGraph = StandardTopologyFactory.CreateStandardGarage();
+        var rehydratedService = new ParkingAllocationService(
+            freshGraph,
+            new AStarPathfinder(),
+            leaseManager,
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance,
+            auditStore: auditStore,
+            tenantContext: tenantContext);
+
+        var restored = await rehydratedService.RehydrateStateAsync(["default", "tenant-alpha", "tenant-beta"]);
+        Assert.Equal(2, restored);
+        Assert.Single(rehydratedService.GetActiveSessions("tenant-alpha"));
+        Assert.Single(rehydratedService.GetActiveSessions("tenant-beta"));
+        Assert.Empty(rehydratedService.GetActiveSessions("default"));
+    }
+
+    private sealed class MutableTimeProvider(DateTimeOffset startUtc) : TimeProvider
+    {
+        private DateTimeOffset _utcNow = startUtc;
+        public override DateTimeOffset GetUtcNow() => _utcNow;
+        public void Advance(TimeSpan delta) => _utcNow = _utcNow.Add(delta);
     }
 
     private sealed class BarrierAsyncLeaseManager(int expectedInitialArrivals) : IBayLeaseManager

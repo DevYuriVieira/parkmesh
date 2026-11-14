@@ -190,8 +190,9 @@ app.MapGet("/api/parking/snapshot", (
     IParkingAllocationService allocationService,
     IEngineMetricsRecorder metrics,
     ITelemetryIngestionChannel telemetryChannel,
-    SignalRParkingEventSink eventSink) =>
-    Results.Ok(SnapshotBuilder.Build(allocationService, metrics, telemetryChannel, eventSink)));
+    SignalRParkingEventSink eventSink,
+    ITenantContext tenantContext) =>
+    Results.Ok(SnapshotBuilder.Build(allocationService, metrics, telemetryChannel, eventSink, tenantContext.CurrentTenantId)));
 
 app.MapGet("/api/parking/metrics", (
     IParkingAllocationService allocationService,
@@ -334,8 +335,10 @@ app.MapPatch("/api/parking/bays/{bayId}/maintenance", async (
     }
 }).AddEndpointFilter<ApiKeyEndpointFilter>();
 
-app.MapGet("/api/parking/sessions", (IParkingAllocationService allocationService) =>
-    Results.Ok(allocationService.GetActiveSessions()));
+app.MapGet("/api/parking/sessions", (
+    IParkingAllocationService allocationService,
+    ITenantContext tenantContext) =>
+    Results.Ok(allocationService.GetActiveSessions(tenantContext.CurrentTenantId)));
 
 app.MapPost("/api/parking/sessions/{sessionId}/progress", async (
     string sessionId,
@@ -360,11 +363,12 @@ app.MapPost("/api/parking/telemetry/readings", (
 
 var chaosIntruderEndpoint = app.MapPost("/api/parking/chaos/intruder", async (
     IParkingAllocationService allocationService,
+    ITenantContext tenantContext,
     CancellationToken ct) =>
 {
-    var targetSession = allocationService.GetActiveSessions().FirstOrDefault();
+    var targetSession = allocationService.GetActiveSessions(tenantContext.CurrentTenantId).FirstOrDefault();
     if (targetSession is null)
-        return Results.Conflict(new { error = "No active leased bay available for intrusion." });
+        return Results.Conflict(new { error = "No active leased bay available for intrusion in the current tenant." });
 
     var result = await allocationService.ReconcilePhysicalOccupancyAsync(
         targetSession.AssignedBayId,

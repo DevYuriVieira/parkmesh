@@ -16,15 +16,18 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
     private readonly IConnectionMultiplexer _redis;
     private readonly RedisLeaseOptions _options;
     private readonly ILogger<RedisBayLeaseManager> _logger;
+    private readonly ITenantContext? _tenantContext;
 
     public RedisBayLeaseManager(
         IConnectionMultiplexer redis,
         IOptions<RedisLeaseOptions> options,
-        ILogger<RedisBayLeaseManager> logger)
+        ILogger<RedisBayLeaseManager> logger,
+        ITenantContext? tenantContext = null)
     {
         _redis = redis;
         _options = options.Value;
         _logger = logger;
+        _tenantContext = tenantContext;
     }
 
     public async Task<LeaseAcquireResult> TryAcquireLeaseAsync(
@@ -170,6 +173,14 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
         }
     }
 
-    private RedisKey BuildLeaseKey(string bayId) => $"{_options.KeyPrefix}:lease:bay:{bayId}";
-    private RedisKey BuildFenceKey(string bayId) => $"{_options.KeyPrefix}:fence:bay:{bayId}";
+    private string GetTenantPrefix()
+    {
+        var tenantId = _tenantContext?.CurrentTenantId ?? TenantDefaults.DefaultTenantId;
+        return string.Equals(tenantId, TenantDefaults.DefaultTenantId, StringComparison.Ordinal)
+            ? _options.KeyPrefix
+            : $"{_options.KeyPrefix}:tenant:{tenantId}";
+    }
+
+    private RedisKey BuildLeaseKey(string bayId) => $"{GetTenantPrefix()}:lease:bay:{bayId}";
+    private RedisKey BuildFenceKey(string bayId) => $"{GetTenantPrefix()}:fence:bay:{bayId}";
 }
