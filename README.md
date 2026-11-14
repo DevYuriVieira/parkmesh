@@ -9,14 +9,20 @@ Motor de roteamento dinâmico de vagas e telemetria IoT em tempo real para estac
 - **Concorrência física com Lease + Fencing Token (Redis):** Reserva temporária de 90s via script Lua atômico e **re-roteamento automático ao vivo** caso outra viatura ocupe a vaga reservada fisicamente.
 - **Painéis de LED & Simulação Visual via SignalR:** Atualização em tempo real por deltas de setas luminosas nos corredores e movimentação dos veículos em canvas interativo.
 
-## Como Rodar (Fase 1 — Core)
+## Como Rodar (Fases 1 e 2)
 
 ```bash
 # Subir Redis, PostgreSQL e Mosquitto
 docker compose -f infra/docker-compose.yml up -d
 
-# Rodar API (com fallback in-memory ou Redis configurado via ConnectionStrings__Redis)
+# Terminal 1 — Motor Central + API (porta 5000)
 dotnet run --project src/ParkMesh.Api
+
+# Terminal 2 — Worker de Ingestão MQTT (debounce + channel backpressure)
+dotnet run --project src/ParkMesh.TelemetryWorker
+
+# Terminal 3 — Simulador de Frota, Ruído Ultrassônico & Invasão de Vagas
+dotnet run --project src/ParkMesh.Simulator
 
 # Rodar testes unitários
 dotnet test tests/ParkMesh.UnitTests
