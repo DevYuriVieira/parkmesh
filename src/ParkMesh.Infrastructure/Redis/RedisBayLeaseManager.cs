@@ -103,6 +103,54 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
         return separatorIndex > 0 ? raw[..separatorIndex] : raw;
     }
 
+    public async Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+        IReadOnlyCollection<string> bayIds,
+        CancellationToken ct = default)
+    {
+        if (bayIds.Count == 0)
+            return Array.Empty<ActiveLeaseSnapshot>();
+
+        var db = _redis.GetDatabase();
+        var batch = db.CreateBatch();
+        var bayList = bayIds as string[] ?? bayIds.ToArray();
+        var tasks = new Task<RedisValueWithExpiry>[bayList.Length];
+
+        for (var i = 0; i < bayList.Length; i++)
+        {
+            tasks[i] = batch.StringGetWithExpiryAsync(BuildLeaseKey(bayList[i]));
+        }
+
+        batch.Execute();
+        var values = await Task.WhenAll(tasks);
+        var active = new List<ActiveLeaseSnapshot>();
+
+        for (var i = 0; i < bayList.Length; i++)
+        {
+            var entry = values[i];
+            if (entry.Value.IsNullOrEmpty)
+                continue;
+
+            var raw = entry.Value.ToString();
+            var separatorIndex = raw.LastIndexOf(':');
+            if (separatorIndex <= 0 ||
+                !long.TryParse(raw.AsSpan(separatorIndex + 1), out var fencingToken))
+            {
+                continue;
+            }
+
+            if (entry.Expiry is { } expiry && expiry <= TimeSpan.Zero)
+                continue;
+
+            active.Add(new ActiveLeaseSnapshot(
+                bayList[i],
+                raw[..separatorIndex],
+                fencingToken,
+                entry.Expiry));
+        }
+
+        return active;
+    }
+
     public async Task<bool> PingAsync(CancellationToken ct = default)
     {
         try

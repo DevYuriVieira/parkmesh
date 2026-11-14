@@ -41,5 +41,29 @@ public sealed class InMemoryParkingAuditStore : IParkingAuditStore
         }
     }
 
+    public Task<IReadOnlyDictionary<string, AuditEventType>> GetLatestBayPhysicalStatesAsync(CancellationToken ct = default)
+    {
+        var states = new Dictionary<string, AuditEventType>(StringComparer.OrdinalIgnoreCase);
+        lock (_lock)
+        {
+            foreach (var ev in _events)
+            {
+                if (states.ContainsKey(ev.BayId))
+                    continue;
+
+                if (ev.EventType is AuditEventType.PhysicalOccupied
+                    or AuditEventType.IntrusionRerouted
+                    or AuditEventType.PhysicalVacated
+                    or AuditEventType.BayOutOfService
+                    or AuditEventType.BayRestored)
+                {
+                    states[ev.BayId] = ev.EventType;
+                }
+            }
+        }
+
+        return Task.FromResult<IReadOnlyDictionary<string, AuditEventType>>(states);
+    }
+
     public Task<bool> CheckConnectivityAsync(CancellationToken ct = default) => Task.FromResult(true);
 }

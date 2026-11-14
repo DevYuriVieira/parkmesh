@@ -68,6 +68,8 @@ builder.Services.AddParkMeshTelemetry(builder.Configuration);
 
 builder.Services.AddSingleton<SignalRParkingEventSink>();
 builder.Services.AddSingleton<IParkingEventSink>(sp => sp.GetRequiredService<SignalRParkingEventSink>());
+builder.Services.AddSingleton<IStateHydrationTracker, StateHydrationTracker>();
+builder.Services.AddHostedService<GarageStateHydrationHostedService>();
 builder.Services.AddHostedService<MetricsBroadcastHostedService>();
 builder.Services.AddHostedService<LeaseExpirationSweeperHostedService>();
 
@@ -116,19 +118,24 @@ app.MapGet("/health/live", () => Results.Ok(new { status = "live", service = "Pa
 app.MapGet("/health/ready", async (
     IBayLeaseManager leaseManager,
     IParkingAuditStore auditStore,
+    IStateHydrationTracker hydrationTracker,
     CancellationToken ct) =>
 {
     var leaseHealthy = await leaseManager.PingAsync(ct);
     var auditHealthy = await auditStore.CheckConnectivityAsync(ct);
-    var ready = leaseHealthy && auditHealthy;
+    var hydrated = hydrationTracker.IsHydrated;
+    var ready = leaseHealthy && auditHealthy && hydrated;
 
     var payload = new
     {
         status = ready ? "ready" : "degraded",
+        hydrated,
+        restoredStates = hydrationTracker.RestoredStateCount,
         dependencies = new
         {
             leaseStore = leaseHealthy ? "healthy" : "unhealthy",
-            auditStore = auditHealthy ? "healthy" : "unhealthy"
+            auditStore = auditHealthy ? "healthy" : "unhealthy",
+            stateHydration = hydrated ? "hydrated" : (hydrationTracker.LastError ?? "hydrating")
         }
     };
 

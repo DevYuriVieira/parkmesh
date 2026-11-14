@@ -21,6 +21,9 @@ public sealed class PostgresParkingAuditStore : IParkingAuditStore, IAsyncDispos
 
         CREATE INDEX IF NOT EXISTS ix_parking_audit_events_occurred_at
             ON parking_audit_events (occurred_at_utc DESC, id DESC);
+
+        CREATE INDEX IF NOT EXISTS ix_parking_audit_events_bay_id
+            ON parking_audit_events (bay_id, id DESC);
         """;
 
     private const string InsertSql = """
@@ -35,6 +38,13 @@ public sealed class PostgresParkingAuditStore : IParkingAuditStore, IAsyncDispos
         FROM parking_audit_events
         ORDER BY id DESC
         LIMIT @limit;
+        """;
+
+    private const string SelectLatestPhysicalStatesSql = """
+        SELECT DISTINCT ON (bay_id) bay_id, event_type
+        FROM parking_audit_events
+        WHERE event_type IN ('PhysicalOccupied', 'IntrusionRerouted', 'PhysicalVacated', 'BayOutOfService', 'BayRestored')
+        ORDER BY bay_id, id DESC;
         """;
 
     private readonly NpgsqlDataSource _dataSource;
@@ -103,6 +113,24 @@ public sealed class PostgresParkingAuditStore : IParkingAuditStore, IAsyncDispos
         }
 
         return results;
+    }
+
+    public async Task<IReadOnlyDictionary<string, AuditEventType>> GetLatestBayPhysicalStatesAsync(
+        CancellationToken ct = default)
+    {
+        var states = new Dictionary<string, AuditEventType>(StringComparer.OrdinalIgnoreCase);
+
+        await using var cmd = _dataSource.CreateCommand(SelectLatestPhysicalStatesSql);
+        await using var reader = await cmd.ExecuteReaderAsync(ct);
+
+        while (await reader.ReadAsync(ct))
+        {
+            var bayId = reader.GetString(0);
+            var eventType = Enum.Parse<AuditEventType>(reader.GetString(1), ignoreCase: true);
+            states[bayId] = eventType;
+        }
+
+        return states;
     }
 
     public async Task<bool> CheckConnectivityAsync(CancellationToken ct = default)

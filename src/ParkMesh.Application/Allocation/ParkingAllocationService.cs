@@ -30,6 +30,8 @@ public interface IParkingAllocationService
     IReadOnlyCollection<ActiveVehicleSession> GetActiveSessions();
 
     Task<IReadOnlyList<ExpiredLeaseInfo>> PurgeExpiredSessionsAsync(CancellationToken ct = default);
+
+    Task<int> RehydrateStateAsync(CancellationToken ct = default);
 }
 
 public sealed class ParkingAllocationService : IParkingAllocationService
@@ -44,6 +46,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     private readonly IParkingEventSink _eventSink;
     private readonly IEngineMetricsRecorder _metrics;
     private readonly IParkingAuditSink _auditSink;
+    private readonly IParkingAuditStore _auditStore;
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ParkingAllocationService> _logger;
     private readonly ConcurrentDictionary<string, ActiveVehicleSession> _sessions = new(StringComparer.OrdinalIgnoreCase);
@@ -59,7 +62,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         IParkingEventSink? eventSink = null,
         IEngineMetricsRecorder? metrics = null,
         TimeProvider? timeProvider = null,
-        IParkingAuditSink? auditSink = null)
+        IParkingAuditSink? auditSink = null,
+        IParkingAuditStore? auditStore = null)
     {
         _graph = graph;
         _pathfinder = pathfinder;
@@ -71,6 +75,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         _metrics = metrics ?? NullEngineMetricsRecorder.Instance;
         _timeProvider = timeProvider ?? TimeProvider.System;
         _auditSink = auditSink ?? NullParkingAuditSink.Instance;
+        _auditStore = auditStore ?? NullParkingAuditStore.Instance;
     }
 
     public ParkingGraph Graph => _graph;
@@ -437,5 +442,126 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         }
 
         return expired;
+    }
+
+    public async Task<int> RehydrateStateAsync(CancellationToken ct = default)
+    {
+        var physicalStates = await _auditStore.GetLatestBayPhysicalStatesAsync(ct);
+        var bayIds = _graph.BaysById.Keys.ToArray();
+        var activeLeases = await _leaseManager.GetActiveLeasesAsync(bayIds, ct);
+
+        Dictionary<(string BayId, long Token), ParkingAuditEvent>? allocationAuditByLease = null;
+        if (activeLeases.Count > 0)
+        {
+            var recentEvents = await _auditStore.GetRecentAsync(200, ct);
+            allocationAuditByLease = new Dictionary<(string BayId, long Token), ParkingAuditEvent>();
+            foreach (var ev in recentEvents)
+            {
+                if (ev.EventType == AuditEventType.BayAllocated && ev.FencingToken.HasValue)
+                {
+                    allocationAuditByLease.TryAdd((ev.BayId, ev.FencingToken.Value), ev);
+                }
+            }
+        }
+
+        var defaultGateId = _graph.Gates.FirstOrDefault()?.Id;
+        var precomputedRoutes = new List<(ActiveLeaseSnapshot Lease, ParkingRoute Route, VehicleType VehicleType, string StartNodeId)>(activeLeases.Count);
+
+        foreach (var lease in activeLeases)
+        {
+            if (!_graph.TryGetBay(lease.BayId, out var bay))
+                continue;
+
+            ParkingAuditEvent? allocEvent = null;
+            allocationAuditByLease?.TryGetValue((lease.BayId, lease.FencingToken), out allocEvent);
+
+            var startNodeId = allocEvent?.NodeId is not null && _graph.TryGetNode(allocEvent.NodeId, out _)
+                ? allocEvent.NodeId
+                : defaultGateId ?? bay.NodeId;
+
+            var vehicleType = allocEvent?.VehicleType ?? bay.PrimaryType;
+            var route = _pathfinder.FindShortestPath(_graph, startNodeId, bay.BayId)
+                ?? _pathfinder.FindShortestPath(_graph, bay.NodeId, bay.BayId);
+
+            if (route is null)
+                continue;
+
+            precomputedRoutes.Add((lease, route, vehicleType, startNodeId));
+        }
+
+        var now = _timeProvider.GetUtcNow();
+        var restoredSessions = new List<ActiveVehicleSession>(precomputedRoutes.Count);
+        var restoredCount = 0;
+
+        lock (_stateLock)
+        {
+            foreach (var (bayId, eventType) in physicalStates)
+            {
+                if (!_graph.TryGetBay(bayId, out var bay))
+                    continue;
+
+                switch (eventType)
+                {
+                    case AuditEventType.PhysicalOccupied or AuditEventType.IntrusionRerouted:
+                        if (bay.Status != BayStatus.Occupied)
+                        {
+                            bay.MarkOccupied();
+                            restoredCount++;
+                        }
+                        break;
+
+                    case AuditEventType.BayOutOfService:
+                        if (bay.Status != BayStatus.OutOfService)
+                        {
+                            bay.MarkOutOfService();
+                            restoredCount++;
+                        }
+                        break;
+
+                    case AuditEventType.PhysicalVacated or AuditEventType.BayRestored:
+                        if (bay.Status is BayStatus.Occupied or BayStatus.OutOfService)
+                        {
+                            bay.MarkFree();
+                        }
+                        break;
+                }
+            }
+
+            foreach (var (lease, route, vehicleType, startNodeId) in precomputedRoutes)
+            {
+                if (!_graph.TryGetBay(lease.BayId, out var bay))
+                    continue;
+
+                var expiresAt = now.Add(lease.RemainingTtl is { } ttl && ttl > TimeSpan.Zero ? ttl : DefaultLeaseTtl);
+                if (!bay.TrySetLeased(lease.VehicleSessionId, lease.FencingToken, expiresAt))
+                    continue;
+
+                var session = new ActiveVehicleSession(
+                    lease.VehicleSessionId,
+                    vehicleType,
+                    lease.BayId,
+                    lease.FencingToken,
+                    route,
+                    startNodeId,
+                    now,
+                    expiresAt);
+
+                _sessions[lease.VehicleSessionId] = session;
+                restoredSessions.Add(session);
+                restoredCount++;
+            }
+        }
+
+        foreach (var session in restoredSessions)
+        {
+            _congestionTracker.AddRouteLoad(session.Route.Steps.Select(s => s.EdgeId));
+        }
+
+        _logger.LogInformation(
+            "Rehydrated garage state on startup: {RestoredCount} bay states ({LeaseCount} active leases).",
+            restoredCount,
+            restoredSessions.Count);
+
+        return restoredCount;
     }
 }
