@@ -1,0 +1,33 @@
+@ParkMesh_HostAddress = http://localhost:5000
+
+### Health check
+GET {{ParkMesh_HostAddress}}/health
+
+### Full 3-floor garage topology (120 bays)
+GET {{ParkMesh_HostAddress}}/api/parking/topology
+
+### Filter free EV bays on Floor 0
+GET {{ParkMesh_HostAddress}}/api/parking/bays?floor=0&status=Free&vehicleType=EV
+
+### Allocate bay for EV entering GATE-N1
+POST {{ParkMesh_HostAddress}}/api/parking/allocations
+Content-Type: application/json
+
+{
+  "gateId": "GATE-N1",
+  "vehicleSessionId": "SES-DEMO-01",
+  "vehicleType": "EV",
+  "leaseSeconds": 90
+}
+
+### Simulate physical intrusion on a leased bay (triggers live reroute)
+POST {{ParkMesh_HostAddress}}/api/parking/bays/F0-B05/occupancy
+Content-Type: application/json
+
+{
+  "occupied": true,
+  "occupantSessionId": "INTRUDER-01"
+}
+
+### Active vehicle sessions
+GET {{ParkMesh_HostAddress}}/api/parking/sessions
