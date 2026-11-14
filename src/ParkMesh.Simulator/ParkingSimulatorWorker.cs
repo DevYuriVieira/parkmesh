@@ -16,6 +16,7 @@ public sealed class SimulatorOptions
 {
     public const string SectionName = "Simulator";
     public string ApiBaseUrl { get; set; } = "http://localhost:5000";
+    public string ApiKey { get; set; } = string.Empty;
     public int TickIntervalMs { get; set; } = 600;
     public double ArrivalProbabilityPerTick { get; set; } = 0.35;
     public int MaxConcurrentCars { get; set; } = 18;
@@ -69,6 +70,11 @@ public sealed class ParkingSimulatorWorker : BackgroundService
         {
             BaseAddress = new Uri(_options.ApiBaseUrl.TrimEnd('/') + "/")
         };
+
+        if (!string.IsNullOrWhiteSpace(_options.ApiKey))
+        {
+            _http.DefaultRequestHeaders.Add("X-Api-Key", _options.ApiKey);
+        }
     }
 
     protected override async Task ExecuteAsync(CancellationToken stoppingToken)

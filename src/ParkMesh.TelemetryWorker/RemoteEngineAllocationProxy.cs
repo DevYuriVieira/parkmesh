@@ -12,6 +12,7 @@ public sealed class ParkMeshApiOptions
 {
     public const string SectionName = "ParkMeshApi";
     public string BaseUrl { get; set; } = "http://localhost:5000";
+    public string ApiKey { get; set; } = string.Empty;
 }
 
 public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDisposable
@@ -35,6 +36,11 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
         {
             BaseAddress = new Uri(apiOptions.Value.BaseUrl.TrimEnd('/') + "/")
         };
+
+        if (!string.IsNullOrWhiteSpace(apiOptions.Value.ApiKey))
+        {
+            _httpClient.DefaultRequestHeaders.Add("X-Api-Key", apiOptions.Value.ApiKey);
+        }
     }
 
     public ParkingGraph Graph { get; }
@@ -98,6 +104,9 @@ public sealed class RemoteEngineAllocationProxy : IParkingAllocationService, IDi
         ValueTask.FromResult(false);
 
     public IReadOnlyCollection<ActiveVehicleSession> GetActiveSessions() => Array.Empty<ActiveVehicleSession>();
+
+    public Task<IReadOnlyList<ExpiredLeaseInfo>> PurgeExpiredSessionsAsync(CancellationToken ct = default) =>
+        Task.FromResult<IReadOnlyList<ExpiredLeaseInfo>>(Array.Empty<ExpiredLeaseInfo>());
 
     public void Dispose() => _httpClient.Dispose();
 

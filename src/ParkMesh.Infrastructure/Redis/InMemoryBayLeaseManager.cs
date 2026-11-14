@@ -77,4 +77,6 @@ public sealed class InMemoryBayLeaseManager : IBayLeaseManager
             return Task.FromResult<string?>(null);
         }
     }
+
+    public Task<bool> PingAsync(CancellationToken ct = default) => Task.FromResult(true);
 }

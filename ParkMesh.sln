@@ -23,6 +23,10 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ParkMesh.TelemetryWorker", 
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ParkMesh.Simulator", "src\ParkMesh.Simulator\ParkMesh.Simulator.csproj", "{87EF6118-F62A-4720-B2C7-6FB034940C3E}"
 EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "benchmarks", "benchmarks", "{66320409-64EC-F7C5-3DEF-65E7510DAAD1}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "ParkMesh.Benchmarks", "benchmarks\ParkMesh.Benchmarks\ParkMesh.Benchmarks.csproj", "{7FF3B622-074D-44D1-857F-82BE4C0B208B}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|Any CPU = Debug|Any CPU
@@ -129,6 +133,18 @@ Global
 		{87EF6118-F62A-4720-B2C7-6FB034940C3E}.Release|x64.Build.0 = Release|Any CPU
 		{87EF6118-F62A-4720-B2C7-6FB034940C3E}.Release|x86.ActiveCfg = Release|Any CPU
 		{87EF6118-F62A-4720-B2C7-6FB034940C3E}.Release|x86.Build.0 = Release|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Debug|x64.ActiveCfg = Debug|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Debug|x64.Build.0 = Debug|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Debug|x86.ActiveCfg = Debug|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Debug|x86.Build.0 = Debug|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Release|Any CPU.Build.0 = Release|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Release|x64.ActiveCfg = Release|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Release|x64.Build.0 = Release|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Release|x86.ActiveCfg = Release|Any CPU
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B}.Release|x86.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
@@ -142,5 +158,6 @@ Global
 		{EE7DECAA-E60E-4228-B38C-4E834EFD52A8} = {0AB3BF05-4346-4AA6-1389-037BE0695223}
 		{4750EBAD-E0F5-4E13-9F69-DD595EDFEA57} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
 		{87EF6118-F62A-4720-B2C7-6FB034940C3E} = {827E0CD3-B72D-47B6-A68D-7590B98EB39B}
+		{7FF3B622-074D-44D1-857F-82BE4C0B208B} = {66320409-64EC-F7C5-3DEF-65E7510DAAD1}
 	EndGlobalSection
 EndGlobal

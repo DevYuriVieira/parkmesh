@@ -26,4 +26,6 @@ public interface IBayLeaseManager
     Task<string?> GetActiveLeaseHolderAsync(
         string bayId,
         CancellationToken ct = default);
+
+    Task<bool> PingAsync(CancellationToken ct = default) => Task.FromResult(true);
 }

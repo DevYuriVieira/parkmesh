@@ -5,7 +5,9 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 
@@ -35,6 +37,12 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         var health = await _client.GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, health.StatusCode);
 
+        var live = await _client.GetAsync("/health/live");
+        Assert.Equal(HttpStatusCode.OK, live.StatusCode);
+
+        var ready = await _client.GetAsync("/health/ready");
+        Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
+
         var topologyResponse = await _client.GetFromJsonAsync<TopologySummary>("/api/parking/topology", JsonOptions);
         Assert.NotNull(topologyResponse);
         Assert.Equal(3, topologyResponse.Floors);
@@ -57,6 +65,11 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         var metrics = await _client.GetFromJsonAsync<EngineMetricsSnapshot>("/api/parking/metrics", JsonOptions);
         Assert.NotNull(metrics);
         Assert.Equal(120, metrics.TotalBays);
+
+        var prometheus = await _client.GetAsync("/metrics");
+        Assert.Equal(HttpStatusCode.OK, prometheus.StatusCode);
+        var prometheusBody = await prometheus.Content.ReadAsStringAsync();
+        Assert.Contains("# TYPE", prometheusBody, StringComparison.Ordinal);
     }
 
     [Fact]
@@ -229,6 +242,95 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         Assert.True(metrics.EnqueuedCount >= 1);
     }
 
+    [Fact]
+    public async Task AuditEndpoint_RecordsAllocationIntrusionAndReleaseEvents()
+    {
+        var sessionId = $"AUDIT-{Guid.NewGuid():N}"[..14];
+        var allocateResponse = await _client.PostAsJsonAsync(
+            "/api/parking/allocations",
+            new AllocateSpotApiRequest("GATE-N1", sessionId, VehicleType.Standard, 90),
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.Created, allocateResponse.StatusCode);
+        var created = await allocateResponse.Content.ReadFromJsonAsync<AllocationEnvelope>(JsonOptions);
+        Assert.NotNull(created?.Session);
+
+        var intruderResponse = await _client.PostAsJsonAsync(
+            $"/api/parking/bays/{created.Session.AssignedBayId}/occupancy",
+            new PhysicalOccupancyApiRequest(true, "INTRUDER-AUD"),
+            JsonOptions);
+
+        Assert.Equal(HttpStatusCode.OK, intruderResponse.StatusCode);
+        var intruder = await intruderResponse.Content.ReadFromJsonAsync<PhysicalOccupancyResult>(JsonOptions);
+        Assert.NotNull(intruder?.ReroutedSession);
+
+        await _client.DeleteAsync(
+            $"/api/parking/allocations/{intruder.ReroutedSession.AssignedBayId}?fencingToken={intruder.ReroutedSession.FencingToken}");
+
+        await _client.PostAsJsonAsync(
+            $"/api/parking/bays/{created.Session.AssignedBayId}/occupancy",
+            new PhysicalOccupancyApiRequest(false, null),
+            JsonOptions);
+
+        AuditResponse? audit = null;
+        for (var attempt = 0; attempt < 25; attempt++)
+        {
+            audit = await _client.GetFromJsonAsync<AuditResponse>("/api/parking/audit?limit=50", JsonOptions);
+            if (audit is not null
+                && audit.Events.Any(e => e.SessionId == sessionId && e.EventType == AuditEventType.IntrusionRerouted)
+                && audit.Events.Any(e => e.SessionId == sessionId && e.EventType == AuditEventType.LeaseReleased))
+            {
+                break;
+            }
+
+            await Task.Delay(50);
+        }
+
+        Assert.NotNull(audit);
+        Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.BayAllocated);
+        Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.IntrusionRerouted);
+        Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.LeaseReleased);
+    }
+
+    [Fact]
+    public async Task SecurityOptions_EnforceApiKeyAndChaosRateLimitingWhenConfigured()
+    {
+        using var securedFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Security:ApiKey"] = "edge-secret-key",
+                    ["Security:EnableRateLimiting"] = "true",
+                    ["Security:ChaosPermitLimit"] = "1",
+                    ["Security:ChaosWindowSeconds"] = "60"
+                });
+            });
+        });
+
+        using var securedClient = securedFactory.CreateClient();
+        var reading = new BaySensorReading("F0-B31", true, 40.0, 1, DateTimeOffset.UtcNow);
+
+        var unauthorized = await securedClient.PostAsJsonAsync("/api/parking/telemetry/readings", reading, JsonOptions);
+        Assert.Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
+
+        using var authorizedRequest = new HttpRequestMessage(HttpMethod.Post, "/api/parking/telemetry/readings")
+        {
+            Content = JsonContent.Create(reading, options: JsonOptions)
+        };
+        authorizedRequest.Headers.Add("X-Api-Key", "edge-secret-key");
+
+        var accepted = await securedClient.SendAsync(authorizedRequest);
+        Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
+
+        var firstChaos = await securedClient.PostAsync("/api/parking/chaos/intruder", null);
+        Assert.NotEqual(HttpStatusCode.TooManyRequests, firstChaos.StatusCode);
+
+        var limitedChaos = await securedClient.PostAsync("/api/parking/chaos/intruder", null);
+        Assert.Equal(HttpStatusCode.TooManyRequests, limitedChaos.StatusCode);
+    }
+
     private static bool IsHubTarget(JsonDocument doc, string targetName) =>
         doc.RootElement.TryGetProperty("type", out var t)
         && t.GetInt32() == 1
@@ -292,4 +394,5 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
     private sealed record TopologySummary(int Floors, int TotalNodes, int TotalEdges, int TotalBays);
     private sealed record AllocationEnvelope(ActiveVehicleSession Session, double ComputationTimeMs);
     private sealed record BurstEnvelope(int Requested, int Succeeded, int Failed, List<ActiveVehicleSession> Sessions);
+    private sealed record AuditResponse(int Count, long DroppedCount, List<ParkingAuditEvent> Events);
 }

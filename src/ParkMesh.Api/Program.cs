@@ -1,16 +1,54 @@
 using System.Text.Json.Serialization;
+using System.Threading.RateLimiting;
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
 using Microsoft.Extensions.FileProviders;
+using Microsoft.Extensions.Options;
+using Npgsql;
 using OpenTelemetry.Metrics;
 using OpenTelemetry.Resources;
 using OpenTelemetry.Trace;
 using ParkMesh.Api.Realtime;
+using ParkMesh.Api.Security;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Audit;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 using ParkMesh.Infrastructure;
 
 var builder = WebApplication.CreateBuilder(args);
+
+builder.Services.Configure<SecurityOptions>(builder.Configuration.GetSection(SecurityOptions.SectionName));
+
+builder.Services.AddRateLimiter(options =>
+{
+    options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+    options.OnRejected = async (context, token) =>
+    {
+        context.HttpContext.Response.ContentType = "application/json";
+        await context.HttpContext.Response.WriteAsJsonAsync(
+            new { error = "Rate limit exceeded on chaos endpoints." },
+            token);
+    };
+
+    options.AddPolicy("chaos", httpContext =>
+    {
+        var security = httpContext.RequestServices.GetRequiredService<IOptionsMonitor<SecurityOptions>>().CurrentValue;
+        if (!security.EnableRateLimiting)
+            return RateLimitPartition.GetNoLimiter("disabled");
+
+        return RateLimitPartition.GetFixedWindowLimiter(
+            partitionKey: "chaos-global",
+            factory: _ => new FixedWindowRateLimiterOptions
+            {
+                PermitLimit = Math.Max(1, security.ChaosPermitLimit),
+                Window = TimeSpan.FromSeconds(Math.Max(1, security.ChaosWindowSeconds)),
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                QueueLimit = 0
+            });
+    });
+});
 
 builder.Services.ConfigureHttpJsonOptions(options =>
 {
@@ -31,6 +69,7 @@ builder.Services.AddParkMeshTelemetry(builder.Configuration);
 builder.Services.AddSingleton<SignalRParkingEventSink>();
 builder.Services.AddSingleton<IParkingEventSink>(sp => sp.GetRequiredService<SignalRParkingEventSink>());
 builder.Services.AddHostedService<MetricsBroadcastHostedService>();
+builder.Services.AddHostedService<LeaseExpirationSweeperHostedService>();
 
 var otlpEndpoint = builder.Configuration["OTEL_EXPORTER_OTLP_ENDPOINT"];
 builder.Services
@@ -40,7 +79,8 @@ builder.Services
     {
         tracing
             .AddSource(EngineMetricsRecorder.ActivitySourceName)
-            .AddAspNetCoreInstrumentation();
+            .AddAspNetCoreInstrumentation()
+            .AddNpgsql();
 
         if (!string.IsNullOrWhiteSpace(otlpEndpoint))
             tracing.AddOtlpExporter();
@@ -49,13 +89,17 @@ builder.Services
     {
         metrics
             .AddMeter(EngineMetricsRecorder.MeterName)
-            .AddAspNetCoreInstrumentation();
+            .AddAspNetCoreInstrumentation()
+            .AddPrometheusExporter();
 
         if (!string.IsNullOrWhiteSpace(otlpEndpoint))
             metrics.AddOtlpExporter();
     });
 
 var app = builder.Build();
+
+app.UseRateLimiter();
+app.UseOpenTelemetryPrometheusScrapingEndpoint();
 
 var webRoot = ResolveWebDirectory(app.Environment.ContentRootPath);
 if (webRoot is not null)
@@ -66,6 +110,32 @@ if (webRoot is not null)
 }
 
 app.MapGet("/health", () => Results.Ok(new { status = "healthy", service = "ParkMesh.Api" }));
+
+app.MapGet("/health/live", () => Results.Ok(new { status = "live", service = "ParkMesh.Api" }));
+
+app.MapGet("/health/ready", async (
+    IBayLeaseManager leaseManager,
+    IParkingAuditStore auditStore,
+    CancellationToken ct) =>
+{
+    var leaseHealthy = await leaseManager.PingAsync(ct);
+    var auditHealthy = await auditStore.CheckConnectivityAsync(ct);
+    var ready = leaseHealthy && auditHealthy;
+
+    var payload = new
+    {
+        status = ready ? "ready" : "degraded",
+        dependencies = new
+        {
+            leaseStore = leaseHealthy ? "healthy" : "unhealthy",
+            auditStore = auditHealthy ? "healthy" : "unhealthy"
+        }
+    };
+
+    return ready
+        ? Results.Ok(payload)
+        : Results.Json(payload, statusCode: StatusCodes.Status503ServiceUnavailable);
+});
 
 app.MapGet("/api/parking/topology", (IParkingAllocationService allocationService) =>
 {
@@ -98,6 +168,21 @@ app.MapGet("/api/parking/metrics", (
 {
     var sessions = allocationService.GetActiveSessions();
     return Results.Ok(metrics.BuildSnapshot(allocationService.Graph, sessions.Count, telemetryChannel.GetMetrics()));
+});
+
+app.MapGet("/api/parking/audit", async (
+    [FromQuery] int? limit,
+    IParkingAuditStore auditStore,
+    IParkingAuditSink auditSink,
+    CancellationToken ct) =>
+{
+    var items = await auditStore.GetRecentAsync(limit ?? 50, ct);
+    return Results.Ok(new
+    {
+        count = items.Count,
+        droppedCount = auditSink.DroppedCount,
+        events = items
+    });
 });
 
 app.MapGet("/api/parking/bays", (
@@ -195,7 +280,7 @@ app.MapPost("/api/parking/bays/{bayId}/occupancy", async (
     {
         return Results.NotFound(new { error = $"Bay '{bayId}' not found." });
     }
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/sessions", (IParkingAllocationService allocationService) =>
     Results.Ok(allocationService.GetActiveSessions()));
@@ -208,7 +293,7 @@ app.MapPost("/api/parking/sessions/{sessionId}/progress", async (
 {
     var updated = await allocationService.UpdateVehicleProgressAsync(sessionId, request.CurrentNodeId, ct);
     return updated ? Results.Ok(new { sessionId, request.CurrentNodeId }) : Results.NotFound();
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/telemetry/metrics", (ITelemetryIngestionChannel channel) =>
     Results.Ok(channel.GetMetrics()));
@@ -219,9 +304,9 @@ app.MapPost("/api/parking/telemetry/readings", (
 {
     var enqueued = channel.TryEnqueue(reading);
     return enqueued ? Results.Accepted() : Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
-app.MapPost("/api/parking/chaos/intruder", async (
+var chaosIntruderEndpoint = app.MapPost("/api/parking/chaos/intruder", async (
     IParkingAllocationService allocationService,
     CancellationToken ct) =>
 {
@@ -238,7 +323,7 @@ app.MapPost("/api/parking/chaos/intruder", async (
     return Results.Ok(result);
 });
 
-app.MapPost("/api/parking/chaos/burst", async (
+var chaosBurstEndpoint = app.MapPost("/api/parking/chaos/burst", async (
     [FromQuery] int? count,
     IParkingAllocationService allocationService,
     CancellationToken ct) =>
@@ -266,6 +351,9 @@ app.MapPost("/api/parking/chaos/burst", async (
         sessions = results.Where(r => r.Succeeded && r.Session is not null).Select(r => r.Session)
     });
 });
+
+chaosIntruderEndpoint.RequireRateLimiting("chaos");
+chaosBurstEndpoint.RequireRateLimiting("chaos");
 
 app.MapHub<ParkingHub>("/hubs/parking");
 

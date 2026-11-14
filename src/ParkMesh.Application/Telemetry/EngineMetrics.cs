@@ -21,7 +21,8 @@ public sealed record EngineMetricsSnapshot(
     long ReroutesTotal,
     LatencyPercentiles AStarLatency,
     LatencyPercentiles RedisLeaseLatency,
-    TelemetryMetricsSnapshot Telemetry);
+    TelemetryMetricsSnapshot Telemetry,
+    long LeasesExpiredTotal = 0);
 
 public interface IEngineMetricsRecorder
 {
@@ -30,6 +31,7 @@ public interface IEngineMetricsRecorder
     void RecordAllocation();
     void RecordContentionRetry();
     void RecordReroute();
+    void RecordLeaseExpired();
     EngineMetricsSnapshot BuildSnapshot(ParkingGraph graph, int activeSessions, TelemetryMetricsSnapshot telemetry);
 }
 
@@ -102,12 +104,14 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
     private readonly Counter<long> _allocationsCounter;
     private readonly Counter<long> _contentionCounter;
     private readonly Counter<long> _reroutesCounter;
+    private readonly Counter<long> _leasesExpiredCounter;
 
     private readonly SlidingLatencyWindow _astarWindow = new();
     private readonly SlidingLatencyWindow _redisWindow = new();
     private long _allocationsTotal;
     private long _contentionRetriesTotal;
     private long _reroutesTotal;
+    private long _leasesExpiredTotal;
 
     public EngineMetricsRecorder()
     {
@@ -116,6 +120,7 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
         _allocationsCounter = _meter.CreateCounter<long>("parkmesh.allocations.total");
         _contentionCounter = _meter.CreateCounter<long>("parkmesh.allocations.contention");
         _reroutesCounter = _meter.CreateCounter<long>("parkmesh.reroutes.total");
+        _leasesExpiredCounter = _meter.CreateCounter<long>("parkmesh.leases.expired.total");
     }
 
     public void RecordAStarLatency(double durationMs)
@@ -146,6 +151,12 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
     {
         Interlocked.Increment(ref _reroutesTotal);
         _reroutesCounter.Add(1);
+    }
+
+    public void RecordLeaseExpired()
+    {
+        Interlocked.Increment(ref _leasesExpiredTotal);
+        _leasesExpiredCounter.Add(1);
     }
 
     public EngineMetricsSnapshot BuildSnapshot(
@@ -184,7 +195,8 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
             Interlocked.Read(ref _reroutesTotal),
             _astarWindow.ComputePercentiles(),
             _redisWindow.ComputePercentiles(),
-            telemetry);
+            telemetry,
+            Interlocked.Read(ref _leasesExpiredTotal));
     }
 
     public void Dispose() => _meter.Dispose();
@@ -199,6 +211,7 @@ public sealed class NullEngineMetricsRecorder : IEngineMetricsRecorder
     public void RecordAllocation() { }
     public void RecordContentionRetry() { }
     public void RecordReroute() { }
+    public void RecordLeaseExpired() { }
 
     public EngineMetricsSnapshot BuildSnapshot(
         ParkingGraph graph,

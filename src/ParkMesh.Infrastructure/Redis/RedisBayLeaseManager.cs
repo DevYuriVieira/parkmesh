@@ -103,6 +103,20 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
         return separatorIndex > 0 ? raw[..separatorIndex] : raw;
     }
 
+    public async Task<bool> PingAsync(CancellationToken ct = default)
+    {
+        try
+        {
+            var latency = await _redis.GetDatabase().PingAsync();
+            return latency >= TimeSpan.Zero;
+        }
+        catch (Exception ex)
+        {
+            _logger.LogWarning(ex, "Redis connectivity ping failed.");
+            return false;
+        }
+    }
+
     private RedisKey BuildLeaseKey(string bayId) => $"{_options.KeyPrefix}:lease:bay:{bayId}";
     private RedisKey BuildFenceKey(string bayId) => $"{_options.KeyPrefix}:fence:bay:{bayId}";
 }
