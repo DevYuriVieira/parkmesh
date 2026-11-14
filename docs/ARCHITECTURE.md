@@ -37,7 +37,7 @@ flowchart LR
 The parking facility is modeled in memory as a weighted directed graph $G = (V, E)$ via `StandardTopologyFactory.CreateStandardGarage()` (`3` floors: `0`, `1`, `2`; `120` parking bays):
 
 - **Vertices ($V$)**: Entry gates (`NodeType.Gate`), lane intersections (`NodeType.Intersection`), inter-floor helical ramps (`NodeType.Ramp`), and individual bays (`NodeType.Bay`).
-- **Edges ($E$)**: Directed `GraphEdge` segments carrying base distance/weight (`BaseWeight`), length, lane capacity (`Capacity`), optional ramp metadata (`IsRamp`), and dynamic congestion cost adjustments via `IEdgeCongestionTracker`.
+- **Edges ($E$)**: Directed `GraphEdge` segments carrying base distance (`BaseDistance`), ramp indicator (`IsRamp`), ramp penalty (`RampPenalty`), `EffectiveBaseCost`, and dynamic congestion cost adjustments via `IEdgeCongestionTracker`.
 - **A\* Search (`AStarPathfinder`)**: Uses a `PriorityQueue<string, double>` with an admissible Euclidean heuristic incorporating vertical floor elevation cost, ensuring optimal shortest-cost routes while dynamically steering around congested aisles.
 
 ### 3.2 Atomic Bay Allocation, Fencing Tokens & Live Rerouting
@@ -51,7 +51,7 @@ Under high-concurrency bursts (for example 25+ vehicles arriving simultaneously 
 3. **Congestion Lock-In**: Increments live traffic load on edges along the chosen `ParkingRoute` and updates upstream LED directional panels (`DirectionHint`).
 4. **Intrusion Detection & Self-Healing Reroute**: If a physical sensor reports occupancy on a bay in `BayStatus.Leased` state (an unbooked driver stole the spot), `ParkingAllocationService.ReconcilePhysicalOccupancyAsync`:
    - Marks the bay `Occupied`, revokes its active lease via fencing token check (`LuaScripts.ReleaseBayLease`), and removes stale edge congestion.
-   - Locates the affected active session, computes a fresh A\* route starting from the vehicle's `CurrentNodeId`, atomically acquires a new bay lease with a higher fencing token, and emits `RouteReassigned` so both LED panels and live SignalR clients immediately redirect the driver.
+   - Locates the affected active session, computes a fresh A\* route starting from the vehicle's `LastKnownNodeId`, atomically acquires a new bay lease with a higher fencing token, and emits `RouteReassigned` so both LED panels and live SignalR clients immediately redirect the driver.
 
 ### 3.3 Telemetry Ingestion Pipeline & Anti-Flapping
 
@@ -73,9 +73,15 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
     - `LedPanelUpdated`
     - `MetricsTick` (1-second heartbeat carrying P50/P95/P99 latencies, bay counts, allocations, contention retries, reroutes, and telemetry channel counters)
 - **OpenTelemetry Instrumentation (`EngineMetricsRecorder`)**:
-  - `Meter("ParkMesh.Engine")`: Histograms (`parkmesh.astar.duration.ms`, `parkmesh.redis.lease.duration.ms`) and Counters (`parkmesh.allocations.total`, `parkmesh.contention.retries.total`, `parkmesh.reroutes.total`).
-  - `ActivitySource("ParkMesh.Engine")`: Distributed spans around allocation (`AllocateAsync`) and physical occupancy reconciliation (`ReconcilePhysicalOccupancyAsync`).
-  - Sliding-window estimator (`SlidingLatencyWindow`, capacity `1024`) exposing real-time interpolated `P50`, `P95`, and `P99` latencies without GC-heavy heap churn.
+  - `Meter("ParkMesh.Engine")`: Histograms (`parkmesh.routing.astar.duration`, `parkmesh.lease.redis.duration`) and Counters (`parkmesh.allocations.total`, `parkmesh.allocations.contention`, `parkmesh.reroutes.total`, `parkmesh.leases.expired.total`).
+  - `ActivitySource("ParkMesh.Engine")`: Distributed spans around allocation (`parkmesh.allocate`), physical occupancy reconciliation, and `Npgsql` database spans.
+  - Sliding-window estimator (`SlidingLatencyWindow`, capacity `1024`) exposing real-time interpolated `P50`, `P95`, and `P99` latencies, alongside Prometheus scraping at `/metrics` and pre-provisioned Grafana dashboards (`infra/grafana/`).
+
+### 3.5 Durable Audit Outbox, Lease Expiration Sweeper & Edge Hardening
+
+- **Asynchronous Audit Outbox (`AuditChannelSink`, `PostgresParkingAuditStore`, `ParkingAuditHostedService`)**: Allocation, release, expiration, occupancy, and intrusion-reroute events enqueue non-blockingly into a bounded channel (`DropOldest`, capacity `8192`) and flush in batches (`NpgsqlBatch`) to PostgreSQL `parking_audit_events` (or `InMemoryParkingAuditStore` when PostgreSQL is unconfigured).
+- **Proactive Lease Sweeper (`LeaseExpirationSweeperHostedService`)**: Polls `PurgeExpiredSessionsAsync` every 2 seconds using `TimeProvider`, reclaiming abandoned leases, clearing edge congestion, and broadcasting `BayStateChanged` (`Free`) to SignalR clients.
+- **Edge Security & Probes**: Fixed-time `X-Api-Key` verification (`ApiKeyEndpointFilter`) on edge mutation routes when configured, fixed-window rate limiting on chaos endpoints (`429 Too Many Requests`), and dependency-aware `/health/ready` (`Redis` + `PostgreSQL`) alongside `/health/live`.
 
 ---
 
@@ -94,6 +100,10 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 | Sensor Reading | `POST /api/parking/telemetry/readings` | Enqueues a raw sensor reading into `TelemetryIngestionChannel` |
 | Chaos Intruder | `POST /api/parking/chaos/intruder` | Injects a physical intrusion into an active leased bay to demonstrate live rerouting |
 | Chaos Burst | `POST /api/parking/chaos/burst?count=25` | Fires concurrent allocation burst across entry gates (`1..60`) |
+| Audit Log | `GET /api/parking/audit?limit=50` | Recent persisted parking lifecycle audit events |
+| Health (Live) | `GET /health/live` | Process liveness probe |
+| Health (Ready) | `GET /health/ready` | Dependency readiness probe (`Redis` + `PostgreSQL` or in-memory fallbacks) |
+| Prometheus | `GET /metrics` | OpenTelemetry Prometheus scraping endpoint |
 | SignalR Hub | `WS /hubs/parking` | Bidirectional SignalR JSON protocol hub for real-time deltas |
 | MQTT Sensors | `parkmesh/sensors/{floor}/{bayId}/state` | Raw ultrasonic sensor payload stream |
 | MQTT Gates | `parkmesh/gates/{gateId}/admitted` | Gate vehicle admission events |
@@ -110,3 +120,4 @@ Key technical trade-offs are documented in `docs/adr/`:
 3. [ADR 0003 — Multi-Floor A\* Pathfinding with Admissible Euclidean Heuristic](adr/0003-multi-floor-astar-with-admissible-heuristic.md)
 4. [ADR 0004 — Bounded Channel Backpressure and Anti-Flapping Debounce](adr/0004-bounded-channel-backpressure-and-anti-flapping.md)
 5. [ADR 0005 — SignalR Delta Protocol and Zero-Build HTML5 Canvas Simulator](adr/0005-signalr-delta-protocol-and-zero-build-canvas.md)
+6. [ADR 0006 — Asynchronous Audit Outbox, Proactive Lease Reconciliation, and Edge Hardening](adr/0006-async-audit-outbox-and-lease-reconciliation.md)
