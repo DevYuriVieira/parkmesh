@@ -4,6 +4,7 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc.Testing;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 
 namespace ParkMesh.IntegrationTests;
@@ -64,6 +65,18 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         var deleteResponse = await _client.DeleteAsync(
             $"/api/parking/allocations/{reconciled.ReroutedSession.AssignedBayId}?fencingToken={reconciled.ReroutedSession.FencingToken}");
         Assert.Equal(HttpStatusCode.NoContent, deleteResponse.StatusCode);
+    }
+
+    [Fact]
+    public async Task TelemetryReadingsEndpoint_AcceptsReadingsAndUpdatesMetrics()
+    {
+        var reading = new BaySensorReading("F0-B30", true, 50.0, 1, DateTimeOffset.UtcNow);
+        var postResponse = await _client.PostAsJsonAsync("/api/parking/telemetry/readings", reading, JsonOptions);
+        Assert.Equal(HttpStatusCode.Accepted, postResponse.StatusCode);
+
+        var metrics = await _client.GetFromJsonAsync<TelemetryMetricsSnapshot>("/api/parking/telemetry/metrics", JsonOptions);
+        Assert.NotNull(metrics);
+        Assert.True(metrics.EnqueuedCount >= 1);
     }
 
     private sealed record TopologySummary(int Floors, int TotalNodes, int TotalEdges, int TotalBays);
