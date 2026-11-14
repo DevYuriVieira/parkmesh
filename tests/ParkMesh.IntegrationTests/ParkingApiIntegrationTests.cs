@@ -5,6 +5,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc.Testing;
+using Microsoft.Extensions.Configuration;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Application.Audit;
 using ParkMesh.Application.Telemetry;
@@ -35,6 +36,12 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
     {
         var health = await _client.GetAsync("/health");
         Assert.Equal(HttpStatusCode.OK, health.StatusCode);
+
+        var live = await _client.GetAsync("/health/live");
+        Assert.Equal(HttpStatusCode.OK, live.StatusCode);
+
+        var ready = await _client.GetAsync("/health/ready");
+        Assert.Equal(HttpStatusCode.OK, ready.StatusCode);
 
         var topologyResponse = await _client.GetFromJsonAsync<TopologySummary>("/api/parking/topology", JsonOptions);
         Assert.NotNull(topologyResponse);
@@ -278,6 +285,45 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.BayAllocated);
         Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.IntrusionRerouted);
         Assert.Contains(audit.Events, e => e.SessionId == sessionId && e.EventType == AuditEventType.LeaseReleased);
+    }
+
+    [Fact]
+    public async Task SecurityOptions_EnforceApiKeyAndChaosRateLimitingWhenConfigured()
+    {
+        using var securedFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Security:ApiKey"] = "edge-secret-key",
+                    ["Security:EnableRateLimiting"] = "true",
+                    ["Security:ChaosPermitLimit"] = "1",
+                    ["Security:ChaosWindowSeconds"] = "60"
+                });
+            });
+        });
+
+        using var securedClient = securedFactory.CreateClient();
+        var reading = new BaySensorReading("F0-B31", true, 40.0, 1, DateTimeOffset.UtcNow);
+
+        var unauthorized = await securedClient.PostAsJsonAsync("/api/parking/telemetry/readings", reading, JsonOptions);
+        Assert.Equal(HttpStatusCode.Unauthorized, unauthorized.StatusCode);
+
+        using var authorizedRequest = new HttpRequestMessage(HttpMethod.Post, "/api/parking/telemetry/readings")
+        {
+            Content = JsonContent.Create(reading, options: JsonOptions)
+        };
+        authorizedRequest.Headers.Add("X-Api-Key", "edge-secret-key");
+
+        var accepted = await securedClient.SendAsync(authorizedRequest);
+        Assert.Equal(HttpStatusCode.Accepted, accepted.StatusCode);
+
+        var firstChaos = await securedClient.PostAsync("/api/parking/chaos/intruder", null);
+        Assert.NotEqual(HttpStatusCode.TooManyRequests, firstChaos.StatusCode);
+
+        var limitedChaos = await securedClient.PostAsync("/api/parking/chaos/intruder", null);
+        Assert.Equal(HttpStatusCode.TooManyRequests, limitedChaos.StatusCode);
     }
 
     private static bool IsHubTarget(JsonDocument doc, string targetName) =>
