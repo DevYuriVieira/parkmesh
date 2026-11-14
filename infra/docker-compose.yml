@@ -1,0 +1,46 @@
+services:
+  redis:
+    image: redis:7.4-alpine
+    container_name: parkmesh-redis
+    ports:
+      - "6379:6379"
+    command: ["redis-server", "--appendonly", "yes"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  postgres:
+    image: postgres:17-alpine
+    container_name: parkmesh-postgres
+    environment:
+      POSTGRES_DB: parkmesh
+      POSTGRES_USER: parkmesh
+      POSTGRES_PASSWORD: parkmesh_dev_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - parkmesh_pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U parkmesh -d parkmesh"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  mosquitto:
+    image: eclipse-mosquitto:2.0
+    container_name: parkmesh-mosquitto
+    ports:
+      - "1883:1883"
+      - "9001:9001"
+    volumes:
+      - ./mosquitto/mosquitto.conf:/mosquitto/config/mosquitto.conf:ro
+    healthcheck:
+      test: ["CMD", "mosquitto_pub", "-t", "parkmesh/health", "-m", "ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  parkmesh_pgdata:
