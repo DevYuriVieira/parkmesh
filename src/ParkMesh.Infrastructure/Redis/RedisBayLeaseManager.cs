@@ -113,24 +113,28 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
         var db = _redis.GetDatabase();
         var batch = db.CreateBatch();
         var bayList = bayIds as string[] ?? bayIds.ToArray();
-        var tasks = new Task<RedisValueWithExpiry>[bayList.Length];
+        var valueTasks = new Task<RedisValue>[bayList.Length];
+        var ttlTasks = new Task<TimeSpan?>[bayList.Length];
 
         for (var i = 0; i < bayList.Length; i++)
         {
-            tasks[i] = batch.StringGetWithExpiryAsync(BuildLeaseKey(bayList[i]));
+            var leaseKey = BuildLeaseKey(bayList[i]);
+            valueTasks[i] = batch.StringGetAsync(leaseKey);
+            ttlTasks[i] = batch.KeyTimeToLiveAsync(leaseKey);
         }
 
         batch.Execute();
-        var values = await Task.WhenAll(tasks);
+        var values = await Task.WhenAll(valueTasks);
+        var ttls = await Task.WhenAll(ttlTasks);
         var active = new List<ActiveLeaseSnapshot>();
 
         for (var i = 0; i < bayList.Length; i++)
         {
-            var entry = values[i];
-            if (entry.Value.IsNullOrEmpty)
+            var rawValue = values[i];
+            if (rawValue.IsNullOrEmpty)
                 continue;
 
-            var raw = entry.Value.ToString();
+            var raw = rawValue.ToString();
             var separatorIndex = raw.LastIndexOf(':');
             if (separatorIndex <= 0 ||
                 !long.TryParse(raw.AsSpan(separatorIndex + 1), out var fencingToken))
@@ -138,14 +142,15 @@ public sealed class RedisBayLeaseManager : IBayLeaseManager
                 continue;
             }
 
-            if (entry.Expiry is { } expiry && expiry <= TimeSpan.Zero)
+            var remainingTtl = ttls[i];
+            if (remainingTtl is { } ttl && ttl <= TimeSpan.Zero)
                 continue;
 
             active.Add(new ActiveLeaseSnapshot(
                 bayList[i],
                 raw[..separatorIndex],
                 fencingToken,
-                entry.Expiry));
+                remainingTtl));
         }
 
         return active;
