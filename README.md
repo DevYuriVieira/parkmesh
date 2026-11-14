@@ -7,13 +7,13 @@
 ## Key Capabilities
 
 - **Multi-Floor Weighted Directed Graph (`ParkMesh.Domain`)**:
-  - Standard 3-floor (`-1`, `0`, `1`), 120-bay topology with directional driving lanes, inter-floor helical ramps, LED directional display panels, and bay classifications (`Standard`, `Compact`, `EV`, `PRM`, `VIP`).
+  - Standard 3-floor (`-1`, `0`, `1`), 120-bay topology with directional driving lanes, inter-floor helical ramps, LED directional display panels, and `VehicleType` support (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
 - **Dynamic Multi-Floor A\* Pathfinding (`ParkMesh.Application`)**:
   - Computes lowest-cost paths from any entry gate to an optimal candidate bay using an admissible Euclidean + floor-transition heuristic combined with live edge congestion penalties.
 - **Atomic Redis Lua Leases & Fencing Tokens (`ParkMesh.Infrastructure`)**:
-  - Prevents split-brain double-allocation under concurrent vehicle arrivals using atomic Redis `SET ... NX EX` Lua transitions paired with monotonically increasing fencing tokens, plus automatic in-memory fallback when Redis is unavailable locally.
+  - Prevents split-brain double-allocation under concurrent vehicle arrivals using atomic Redis Lua lease acquisition (`LuaScripts.AcquireBayLease`) paired with monotonically increasing fencing tokens, plus automatic in-memory fallback when Redis is unavailable locally.
 - **Physical Intrusion Detection & Live Rerouting**:
-  - When a vehicle physically occupies a reserved bay without holding the matching lease, the engine immediately transitions the bay to `Occupied`, revokes the stale session lease, recalculates an alternative A\* route from the affected vehicle's last known graph node, updates corridor LED panels, and broadcasts `RouteReassigned`.
+  - When a vehicle physically occupies a `Leased` bay without holding the matching lease, `ParkingAllocationService.ReconcilePhysicalOccupancyAsync` immediately transitions the bay to `Occupied`, revokes the stale session lease, recalculates an alternative A\* route from the affected vehicle's `CurrentNodeId`, updates corridor LED panels, and emits `RouteReassigned`.
 - **Bounded Telemetry Ingestion & Anti-Flapping (`ParkMesh.Application`, `ParkMesh.TelemetryWorker`)**:
   - Ingests raw sensor telemetry through a `BoundedChannel<T>` (`DropOldest` backpressure policy) and stabilizes noisy ultrasonic readings with debounce hysteresis (minimum consecutive samples + stability window) before applying domain transitions.
 - **SignalR Delta Streaming, Chaos Testing & OpenTelemetry (`ParkMesh.Api`, `web/`)**:
@@ -80,7 +80,7 @@ dotnet run --project src/ParkMesh.TelemetryWorker
 dotnet run --project src/ParkMesh.Simulator
 ```
 
-The simulator publishes noisy ultrasonic bay readings, physical intrusions, and simulated vehicle movements onto MQTT (`parkmesh/v1/garages/{garageId}/bays/{bayId}/telemetry`), while `ParkMesh.TelemetryWorker` debounces chatter and forwards confirmed transitions to the API engine.
+The simulator publishes noisy ultrasonic bay readings, physical intrusions, and simulated vehicle movements onto MQTT (`parkmesh/sensors/{floor}/{bayId}/state`), while `ParkMesh.TelemetryWorker` debounces chatter and forwards confirmed transitions to the API engine.
 
 ---
 

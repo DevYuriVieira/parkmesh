@@ -6,16 +6,16 @@
 
 ## Context
 
-A physical parking garage is not flat Euclidean space: vehicles must obey one-way aisle geometry, navigate helical inter-floor ramps (`RampUp`, `RampDown`), match vehicle attributes (`EV`, `PRM`, `Compact`, `VIP`, `Standard`), and avoid gridlocked lanes during rush-hour arrivals. Plain BFS/Dijkstra over all bays ignores geometry toward destinations, whereas naive straight-line heuristics ignore vertical floor transitions and congestion weights.
+A physical parking garage is not flat Euclidean space: vehicles must obey directed aisle geometry, navigate helical inter-floor ramps (`NodeType.Ramp`), match vehicle compatibility (`VehicleType`: `Standard`, `EV`, `SUV`, `Pcd`, `Moto`), and avoid gridlocked lanes during rush-hour arrivals. Plain BFS/Dijkstra over all bays ignores geometry toward destinations, whereas naive straight-line heuristics ignore vertical floor transitions and congestion weights.
 
 ## Decision
 
 Model the garage as a directed weighted graph (`ParkingGraph`) and route vehicles with `AStarPathfinder` (`IPathfinder`):
 
-1. Represent spatial coordinates $(x, y, \text{floor})$ per `GraphNode` and model ramps with explicit `GraphEdge` weights and `EdgeType.Ramp`.
-2. Combine static edge distances with dynamic traffic load multipliers exposed by `IEdgeCongestionTracker` so heavily utilized aisles incur higher traversal costs.
-3. Compute the heuristic $h(n, \text{goal})$ using 2D Euclidean distance $\sqrt{(x_n - x_g)^2 + (y_n - y_g)^2}$ plus `Math.Abs(floor_n - floor_g) * floorHeightCost`, remaining admissible when ramp traversal exceeds inter-floor vertical weight.
-4. Support re-anchoring searches from any interior graph node (`LastKnownNodeId`) so live rerouting after a stolen bay does not send the vehicle back to the entry gate.
+1. Represent spatial coordinates $(x, y, \text{floor})$ per `GraphNode` and model ramps with explicit `GraphEdge` weights and `IsRamp` flags.
+2. Combine `BaseWeight` edge distances with dynamic traffic load multipliers exposed by `IEdgeCongestionTracker` so heavily utilized aisles incur higher traversal costs.
+3. Compute the heuristic $h(n, \text{goal})$ using 2D Euclidean distance $\sqrt{(x_n - x_g)^2 + (y_n - y_g)^2}$ plus vertical floor-difference scaling, remaining admissible relative to ramp edge traversal costs.
+4. Support re-anchoring searches from any interior graph node (`CurrentNodeId`) so live rerouting after a stolen bay does not send the vehicle back to the entry gate.
 
 ## Consequences
 

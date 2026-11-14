@@ -12,10 +12,10 @@ When 25 or more vehicles arrive concurrently across multiple entry gates, multip
 
 Implement `RedisBayLeaseManager` backed by atomic server-side Redis Lua scripts (`LuaScripts`):
 
-1. Execute `LuaScripts.TryAcquireLease` atomically inside Redis using `SET parkmesh:lease:{bayId} {sessionId} NX PX {ttlMs}` alongside `INCR parkmesh:fencing:{bayId}` to issue a strictly increasing `long FencingToken` per bay acquisition.
-2. Require matching ownership (`LuaScripts.ReleaseLease`) or higher fencing token semantics before mutating or releasing an active bay reservation.
+1. Execute `LuaScripts.AcquireBayLease` atomically inside Redis by checking `{prefix}:lease:bay:{bayId}` (`EXISTS`), incrementing `{prefix}:fence:bay:{bayId}` (`INCR`), and storing `{sessionId}:{token}` with `SET ... PX {ttlMilliseconds}` to issue a strictly increasing `long FencingToken` per bay acquisition.
+2. Require matching fencing token verification inside `LuaScripts.ReleaseBayLease` before deleting `{prefix}:lease:bay:{bayId}` on release or expiration.
 3. Retry candidate bays deterministically inside `ParkingAllocationService` when contention occurs and record contention retries via `IEngineMetricsRecorder.RecordContentionRetry()`.
-4. Provide `InMemoryBayLeaseManager` implementing the identical `IBayLeaseManager` contract (including atomic `ConcurrentDictionary` transitions and monotonic fencing tokens) when `ConnectionStrings:Redis` is unconfigured for zero-dependency local runs and fast unit/API tests.
+4. Provide `InMemoryBayLeaseManager` implementing the identical `IBayLeaseManager` contract (including atomic transitions and monotonic fencing tokens) when `ConnectionStrings:Redis` is unconfigured for zero-dependency local runs and fast unit/API tests.
 
 ## Consequences
 

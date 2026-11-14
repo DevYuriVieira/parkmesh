@@ -12,16 +12,16 @@ Ultrasonic and radar bay sensors frequently exhibit electromagnetic chatter, par
 
 Implement a two-stage ingestion pipeline in `ParkMesh.Application.Telemetry` and `ParkMesh.TelemetryWorker`:
 
-1. **Bounded Backpressure (`TelemetryIngestionChannel`)**: Buffer incoming `RawSensorReading` frames in a `Channel.CreateBounded<RawSensorReading>` configured with `BoundedChannelFullMode.DropOldest`, ensuring bounded memory consumption and prioritizing freshest hardware state while tracking `DroppedCount`.
-2. **Temporal + Sample-Count Anti-Flapping (`SensorReadingFilter`)**: Maintain per-bay state and require both a minimum consecutive count of matching samples (`MinimumConsecutiveSamples`) and elapsed dwell time (`StabilityWindow`) before emitting a confirmed physical state transition.
-3. **Confirmed Edge Forwarding (`SensorTelemetryProcessor`, `MqttTelemetryHostedService`)**: Invoke `HandlePhysicalOccupancyAsync` only on confirmed transitions, rather than on steady-state heartbeats.
+1. **Bounded Backpressure (`TelemetryIngestionChannel`)**: Buffer incoming `BaySensorReading` frames in a `Channel.CreateBounded<BaySensorReading>` configured with `BoundedChannelFullMode.DropOldest`, ensuring bounded memory consumption and prioritizing freshest hardware state while tracking `StaleDroppedCount` and `EnqueuedCount`.
+2. **Temporal + Sample-Count Anti-Flapping (`SensorReadingFilter`)**: Maintain per-bay state and require both a minimum consecutive count of matching samples (`MinConsecutiveReadings`) and elapsed dwell time (`StabilityWindowMs`) before confirming a physical state transition (`ConfirmedTransitionsCount`).
+3. **Confirmed Edge Forwarding (`SensorTelemetryProcessor`, `MqttTelemetryHostedService`)**: Invoke `ReconcilePhysicalOccupancyAsync` only on confirmed transitions, rather than on steady-state heartbeats.
 
 ## Consequences
 
 ### Positive
 - Completely isolates `ParkingAllocationService` from sensor chatter and pedestrian-crossing false positives.
 - Deterministic bounded memory footprint under arbitrary MQTT frame floods.
-- Measurable `DroppedCount`, `ConfirmedTransitionCount`, and `FilteredNoiseCount` exposed via `/api/parking/metrics` and SignalR `MetricsTick`.
+- Measurable `StaleDroppedCount`, `ConfirmedTransitionsCount`, and `DebouncedCount` exposed via `/api/parking/metrics` and SignalR `MetricsTick`.
 
 ### Negative
-- Adds intentional detection latency equal to `StabilityWindow` for legitimate physical parking events, requiring tuning based on physical vehicle speed and sensor sampling frequency.
+- Adds intentional detection latency equal to `StabilityWindowMs` for legitimate physical parking events, requiring tuning based on physical vehicle speed and sensor sampling frequency.

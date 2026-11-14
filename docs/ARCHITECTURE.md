@@ -20,8 +20,8 @@ flowchart LR
 
 | Project / Directory | Layer | Primary Responsibilities |
 | :--- | :--- | :--- |
-| `src/ParkMesh.Domain` | Domain | Multi-floor weighted directed graph (`ParkingGraph`, `GraphNode`, `GraphEdge`, `ParkingBay`, `ParkingRoute`, `StandardTopologyFactory`), state enums (`BayState`, `BayCategory`, `NodeType`). Zero external dependencies. |
-| `src/ParkMesh.Application` | Application | `AStarPathfinder` (`IPathfinder`), `ParkingAllocationService`, `EdgeCongestionTracker`, `TelemetryIngestionChannel`, `SensorReadingFilter`, `SensorTelemetryProcessor`, `EngineMetricsRecorder` (`SlidingLatencyWindow`, OTel `Meter` & `ActivitySource`), `IParkingEventSink`. |
+| `src/ParkMesh.Domain` | Domain | Multi-floor weighted directed graph (`ParkingGraph`, `GraphNode`, `GraphEdge`, `ParkingBay`, `ParkingRoute`, `StandardTopologyFactory`), domain enums (`BayStatus`, `VehicleType`, `NodeType`, `DirectionHint`). Zero external dependencies. |
+| `src/ParkMesh.Application` | Application | `AStarPathfinder` (`IPathfinder`), `ParkingAllocationService`, `IEdgeCongestionTracker`, `TelemetryIngestionChannel`, `SensorReadingFilter`, `SensorTelemetryProcessor`, `EngineMetricsRecorder` (`SlidingLatencyWindow`, OTel `Meter` & `ActivitySource`), `IParkingEventSink`. |
 | `src/ParkMesh.Infrastructure` | Infrastructure | `RedisBayLeaseManager` & `LuaScripts` (atomic Redis Lua leases + monotonic fencing tokens), `InMemoryBayLeaseManager`, `MqttConnectionManager`, `MqttTelemetryHostedService`, `MqttLedPanelPublisher`, DI wiring. |
 | `src/ParkMesh.Api` | Presentation / Host | Minimal APIs (`/api/parking/...`), `ParkingHub` (`/hubs/parking`), `SignalRParkingEventSink`, `MetricsBroadcastHostedService`, static serving of `web/` at `/`, OpenTelemetry tracing & metrics (`OTLP` export when `OTEL_EXPORTER_OTLP_ENDPOINT` is configured). |
 | `src/ParkMesh.TelemetryWorker` | Edge Worker | Subscribes to raw MQTT sensor frames, filters chatter via `SensorTelemetryProcessor`, and forwards confirmed bay occupancy transitions via `RemoteEngineAllocationProxy`. |
@@ -36,9 +36,9 @@ flowchart LR
 
 The parking facility is modeled in memory as a weighted directed graph $G = (V, E)$ via `StandardTopologyFactory.CreateStandardMultiFloorGarage()` (`3` floors: `-1`, `0`, `1`; `120` parking bays):
 
-- **Vertices ($V$)**: Entry/exit gates (`EntryGate`, `ExitGate`), lane intersections (`Intersection`), inter-floor helical ramps (`RampUp`, `RampDown`), and individual bays (`Bay`).
-- **Edges ($E$)**: Unidirectional driving segments (`EdgeType.Lane`, `Ramp`, `BayAccess`) carrying base distance/travel weight plus live congestion multiplier (`IEdgeCongestionTracker`).
-- **A\* Search (`AStarPathfinder`)**: Uses a `PriorityQueue<string, double>` with an admissible Euclidean heuristic incorporating vertical floor elevation cost (`floorHeightCost`), ensuring optimal shortest-cost routes while dynamically steering around congested aisles.
+- **Vertices ($V$)**: Entry gates (`NodeType.Gate`), lane intersections (`NodeType.Intersection`), inter-floor helical ramps (`NodeType.Ramp`), and individual bays (`NodeType.Bay`).
+- **Edges ($E$)**: Directed `GraphEdge` segments carrying base distance/weight (`BaseWeight`), length, lane capacity (`Capacity`), optional ramp metadata (`IsRamp`), and dynamic congestion cost adjustments via `IEdgeCongestionTracker`.
+- **A\* Search (`AStarPathfinder`)**: Uses a `PriorityQueue<string, double>` with an admissible Euclidean heuristic incorporating vertical floor elevation cost, ensuring optimal shortest-cost routes while dynamically steering around congested aisles.
 
 ### 3.2 Atomic Bay Allocation, Fencing Tokens & Live Rerouting
 
@@ -46,34 +46,35 @@ Under high-concurrency bursts (for example 25+ vehicles arriving simultaneously 
 
 `ParkingAllocationService` + `RedisBayLeaseManager` (`LuaScripts`) eliminate split-brain allocations:
 
-1. **Candidate Ranking**: Queries A\* cost from the vehicle's entry gate to compatible `Free` bays matching `VehicleClass` (`Standard`, `Compact`, `EV`, `PRM`, `VIP`).
-2. **Atomic Lua Acquisition**: Executes `LuaScripts.TryAcquireLease` against `parkmesh:lease:{bayId}` (`SET NX EX`), returning both acquisition status and an atomic `INCR` fencing token (`parkmesh:fencing:{bayId}`).
-3. **Congestion Lock-In**: Increments live traffic load on all edges along the chosen `ParkingRoute` and updates upstream LED directional panels (`LedPanel`).
-4. **Intrusion Detection & Self-Healing Reroute**: If a hardware ultrasonic sensor reports `PhysicalOccupied` on a bay in `Reserved` state (an unbooked driver stole the spot), `ParkingAllocationService.HandlePhysicalOccupancyAsync`:
-   - Marks the bay `Occupied`, releases its active lease, and removes edge congestion from the obsolete tail segment.
-   - Locates the affected active session, computes a fresh A\* route starting from the vehicle's `LastKnownNodeId`, atomically acquires a new bay lease with a higher fencing token, and emits `RouteReassigned` so both LED panels and live SignalR clients immediately redirect the driver.
+1. **Candidate Ranking**: Queries A\* cost from the vehicle's entry gate to compatible `BayStatus.Free` bays matching `VehicleType` (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
+2. **Atomic Lua Acquisition**: Executes `LuaScripts.AcquireBayLease` against `{prefix}:lease:bay:{bayId}` (`SET ... PX`) and `INCR` `{prefix}:fence:bay:{bayId}`, returning both acquisition status and a monotonic fencing token.
+3. **Congestion Lock-In**: Increments live traffic load on edges along the chosen `ParkingRoute` and updates upstream LED directional panels (`DirectionHint`).
+4. **Intrusion Detection & Self-Healing Reroute**: If a physical sensor reports occupancy on a bay in `BayStatus.Leased` state (an unbooked driver stole the spot), `ParkingAllocationService.ReconcilePhysicalOccupancyAsync`:
+   - Marks the bay `Occupied`, revokes its active lease via fencing token check (`LuaScripts.ReleaseBayLease`), and removes stale edge congestion.
+   - Locates the affected active session, computes a fresh A\* route starting from the vehicle's `CurrentNodeId`, atomically acquires a new bay lease with a higher fencing token, and emits `RouteReassigned` so both LED panels and live SignalR clients immediately redirect the driver.
 
 ### 3.3 Telemetry Ingestion Pipeline & Anti-Flapping
 
 Physical bay sensors suffer from reflection noise, pedestrians crossing bays, and network micro-bursts.
 
-- **Bounded Backpressure (`TelemetryIngestionChannel`)**: Uses `System.Threading.Channels.Channel.CreateBounded<RawSensorReading>` with `BoundedChannelFullMode.DropOldest`, bounding memory usage and preserving freshest physical state under traffic spikes.
-- **Anti-Flapping Debounce (`SensorReadingFilter`)**: Requires consecutive matching samples (`MinimumConsecutiveSamples`) spanning at least `StabilityWindow` before confirming a `Free -> Occupied` or `Occupied -> Free` edge transition, preventing spurious reroute storms.
+- **Bounded Backpressure (`TelemetryIngestionChannel`)**: Uses `System.Threading.Channels.Channel.CreateBounded<BaySensorReading>` with `BoundedChannelFullMode.DropOldest`, bounding memory usage and preserving freshest physical state while tracking `StaleDroppedCount` and `EnqueuedCount`.
+- **Anti-Flapping Debounce (`SensorReadingFilter`)**: Requires consecutive matching samples (`MinConsecutiveReadings`) spanning at least `StabilityWindowMs` before confirming a physical transition (`ConfirmedTransitionsCount`), preventing spurious reroute storms while counting suppressed noise (`DebouncedCount`).
+- **Confirmed Edge Forwarding (`SensorTelemetryProcessor`)**: Invokes downstream allocation reconciliation only on confirmed transitions rather than steady-state heartbeats.
 
 ### 3.4 Real-Time Delta Streaming, Chaos Engineering & OpenTelemetry
 
 - **SignalR Hub (`/hubs/parking`)**:
-  - Client call: `GetParkingSnapshot()` returns full initial graph geometry, floor list, LED panels, active sessions, bay states, and metrics snapshot.
+  - Client call: `GetParkingSnapshot()` returns full initial graph geometry, floor list, gates, active sessions, bay states, and metrics snapshot.
   - Server-to-client delta events emitted by `SignalRParkingEventSink` and `MetricsBroadcastHostedService`:
     - `RouteAssigned`
     - `RouteReassigned` (including `PreviousBayId` and `Reason`)
     - `BayStateChanged`
     - `VehicleMoved`
     - `LedPanelUpdated`
-    - `MetricsTick` (1-second heartbeat carrying P50/P95/P99 latencies, throughput, contention retries, reroute count, and channel drop count)
+    - `MetricsTick` (1-second heartbeat carrying P50/P95/P99 latencies, bay counts, allocations, contention retries, reroutes, and telemetry channel counters)
 - **OpenTelemetry Instrumentation (`EngineMetricsRecorder`)**:
   - `Meter("ParkMesh.Engine")`: Histograms (`parkmesh.astar.duration.ms`, `parkmesh.redis.lease.duration.ms`) and Counters (`parkmesh.allocations.total`, `parkmesh.contention.retries.total`, `parkmesh.reroutes.total`).
-  - `ActivitySource("ParkMesh.Engine")`: Distributed spans around allocation (`AllocateRoute`) and physical intrusion recovery (`HandlePhysicalOccupancy`).
+  - `ActivitySource("ParkMesh.Engine")`: Distributed spans around allocation (`AllocateAsync`) and physical occupancy reconciliation (`ReconcilePhysicalOccupancyAsync`).
   - Sliding-window estimator (`SlidingLatencyWindow`, capacity `1024`) exposing real-time interpolated `P50`, `P95`, and `P99` latencies without GC-heavy heap churn.
 
 ---
@@ -91,11 +92,12 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 | Release Session | `DELETE /api/parking/sessions/{sessionId}` | Releases lease and clears edge congestion |
 | Physical Occupancy | `POST /api/parking/bays/{bayId}/occupancy` | Confirms physical occupied/vacated transition (triggers intrusion reroute if stolen) |
 | Sensor Reading | `POST /api/parking/telemetry/readings` | Enqueues a raw sensor reading into `TelemetryIngestionChannel` |
-| Chaos Intruder | `POST /api/parking/chaos/intruder` | Injects a physical intrusion into an active reserved bay to demonstrate live rerouting |
-| Chaos Burst | `POST /api/parking/chaos/burst?count=25` | Fires concurrent allocation burst across entry gates (`1..80`) |
+| Chaos Intruder | `POST /api/parking/chaos/intruder` | Injects a physical intrusion into an active leased bay to demonstrate live rerouting |
+| Chaos Burst | `POST /api/parking/chaos/burst?count=25` | Fires concurrent allocation burst across entry gates (`1..60`) |
 | SignalR Hub | `WS /hubs/parking` | Bidirectional SignalR JSON protocol hub for real-time deltas |
-| MQTT Telemetry | `parkmesh/v1/garages/{garageId}/bays/{bayId}/telemetry` | Raw ultrasonic sensor payload stream |
-| MQTT LED Panels | `parkmesh/v1/garages/{garageId}/panels/{panelId}/command` | Retained LED directional guidance payload |
+| MQTT Sensors | `parkmesh/sensors/{floor}/{bayId}/state` | Raw ultrasonic sensor payload stream |
+| MQTT Gates | `parkmesh/gates/{gateId}/admitted` | Gate vehicle admission events |
+| MQTT LED Panels | `parkmesh/panels/{panelId}/direction` | Retained LED directional guidance payload |
 
 ---
 
