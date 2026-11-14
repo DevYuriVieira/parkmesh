@@ -7,7 +7,7 @@
 ## Key Capabilities
 
 - **Multi-Floor Weighted Directed Graph (`ParkMesh.Domain`)**:
-  - Standard 3-floor (`-1`, `0`, `1`), 120-bay topology with directional driving lanes, inter-floor helical ramps, LED directional display panels, and `VehicleType` support (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
+  - Standard 3-floor (`0`, `1`, `2`), 120-bay topology with directional driving lanes, inter-floor helical ramps, LED directional display panels, and `VehicleType` support (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
 - **Dynamic Multi-Floor A\* Pathfinding (`ParkMesh.Application`)**:
   - Computes lowest-cost paths from any entry gate to an optimal candidate bay using an admissible Euclidean + floor-transition heuristic combined with live edge congestion penalties.
 - **Atomic Redis Lua Leases & Fencing Tokens (`ParkMesh.Infrastructure`)**:
