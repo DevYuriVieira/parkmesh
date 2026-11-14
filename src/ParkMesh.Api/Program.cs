@@ -1,6 +1,7 @@
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc;
 using ParkMesh.Application.Allocation;
+using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
 using ParkMesh.Infrastructure;
 
@@ -13,6 +14,7 @@ builder.Services.ConfigureHttpJsonOptions(options =>
 
 builder.Services.AddParkMeshCore();
 builder.Services.AddParkMeshInfrastructure(builder.Configuration);
+builder.Services.AddParkMeshTelemetry(builder.Configuration);
 
 var app = builder.Build();
 
@@ -135,6 +137,26 @@ app.MapPost("/api/parking/bays/{bayId}/occupancy", async (
 app.MapGet("/api/parking/sessions", (IParkingAllocationService allocationService) =>
     Results.Ok(allocationService.GetActiveSessions()));
 
+app.MapPost("/api/parking/sessions/{sessionId}/progress", (
+    string sessionId,
+    VehicleProgressApiRequest request,
+    IParkingAllocationService allocationService) =>
+{
+    var updated = allocationService.UpdateVehicleProgress(sessionId, request.CurrentNodeId);
+    return updated ? Results.Ok(new { sessionId, request.CurrentNodeId }) : Results.NotFound();
+});
+
+app.MapGet("/api/parking/telemetry/metrics", (ITelemetryIngestionChannel channel) =>
+    Results.Ok(channel.GetMetrics()));
+
+app.MapPost("/api/parking/telemetry/readings", (
+    BaySensorReading reading,
+    ITelemetryIngestionChannel channel) =>
+{
+    var enqueued = channel.TryEnqueue(reading);
+    return enqueued ? Results.Accepted() : Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
+});
+
 app.Run();
 
 public sealed record AllocateSpotApiRequest(
@@ -146,5 +168,7 @@ public sealed record AllocateSpotApiRequest(
 public sealed record PhysicalOccupancyApiRequest(
     bool Occupied,
     string? OccupantSessionId = null);
+
+public sealed record VehicleProgressApiRequest(string CurrentNodeId);
 
 public partial class Program;
