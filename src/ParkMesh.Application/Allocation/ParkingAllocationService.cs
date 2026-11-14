@@ -23,6 +23,11 @@ public interface IParkingAllocationService
         string? occupantSessionId = null,
         CancellationToken ct = default);
 
+    Task<PhysicalOccupancyResult> SetBayMaintenanceAsync(
+        string bayId,
+        bool outOfService,
+        CancellationToken ct = default);
+
     bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId);
 
     ValueTask<bool> UpdateVehicleProgressAsync(string vehicleSessionId, string currentNodeId, CancellationToken ct = default);
@@ -323,10 +328,124 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             return new PhysicalOccupancyResult(bayId, BayStatus.Occupied, false, null, null);
         }
 
+        return await RerouteDisplacedSessionAsync(
+            bayId,
+            BayStatus.Occupied,
+            displacedSession,
+            wasIntruder: true,
+            AuditEventType.IntrusionRerouted,
+            rerouteSuccessDetails: newSession => $"reroutedBay={newSession.AssignedBayId};intruder={occupantSessionId}",
+            rerouteFailureDetails: $"rerouteFailed;intruder={occupantSessionId}",
+            warningReason: "Physical intrusion on leased bay",
+            ct);
+    }
+
+    public async Task<PhysicalOccupancyResult> SetBayMaintenanceAsync(
+        string bayId,
+        bool outOfService,
+        CancellationToken ct = default)
+    {
+        ArgumentException.ThrowIfNullOrWhiteSpace(bayId);
+
+        if (!_graph.TryGetBay(bayId, out var bay))
+            throw new KeyNotFoundException($"Unknown bay '{bayId}'.");
+
+        if (!outOfService)
+        {
+            var restored = false;
+            BayStatus resultingStatus;
+            lock (_stateLock)
+            {
+                if (bay.Status == BayStatus.OutOfService)
+                {
+                    bay.MarkFree();
+                    restored = true;
+                }
+
+                resultingStatus = bay.Status;
+            }
+
+            if (restored)
+            {
+                await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Free, ct);
+                _auditSink.TryEnqueue(new ParkingAuditEvent(
+                    _timeProvider.GetUtcNow(),
+                    AuditEventType.BayRestored,
+                    bayId,
+                    null,
+                    null,
+                    null,
+                    null,
+                    "maintenance cleared"));
+            }
+
+            return new PhysicalOccupancyResult(bayId, resultingStatus, false, null, null);
+        }
+
+        ActiveVehicleSession? displacedSession = null;
+        var changed = false;
+
+        lock (_stateLock)
+        {
+            if (bay.Status == BayStatus.OutOfService)
+                return new PhysicalOccupancyResult(bayId, BayStatus.OutOfService, false, null, null);
+
+            if (bay.CurrentSessionId is not null)
+                _sessions.TryRemove(bay.CurrentSessionId, out displacedSession);
+
+            bay.MarkOutOfService();
+            changed = true;
+        }
+
+        await _leaseManager.InvalidateLeaseAsync(bayId, ct);
+
+        if (displacedSession is not null)
+        {
+            return await RerouteDisplacedSessionAsync(
+                bayId,
+                BayStatus.OutOfService,
+                displacedSession,
+                wasIntruder: false,
+                AuditEventType.BayOutOfService,
+                rerouteSuccessDetails: newSession => $"maintenance;reroutedBay={newSession.AssignedBayId}",
+                rerouteFailureDetails: "maintenance;rerouteFailed",
+                warningReason: "Maintenance OutOfService on leased bay",
+                ct);
+        }
+
+        if (changed)
+        {
+            await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.OutOfService, ct);
+            _auditSink.TryEnqueue(new ParkingAuditEvent(
+                _timeProvider.GetUtcNow(),
+                AuditEventType.BayOutOfService,
+                bayId,
+                null,
+                null,
+                null,
+                null,
+                "manual maintenance"));
+        }
+
+        return new PhysicalOccupancyResult(bayId, BayStatus.OutOfService, false, null, null);
+    }
+
+    private async Task<PhysicalOccupancyResult> RerouteDisplacedSessionAsync(
+        string bayId,
+        BayStatus resultingBayStatus,
+        ActiveVehicleSession displacedSession,
+        bool wasIntruder,
+        AuditEventType auditEventType,
+        Func<ActiveVehicleSession, string> rerouteSuccessDetails,
+        string rerouteFailureDetails,
+        string warningReason,
+        CancellationToken ct)
+    {
         _congestionTracker.RemoveRouteLoad(displacedSession.Route.Steps.Select(s => s.EdgeId));
 
         _logger.LogWarning(
-            "Physical intrusion on leased bay {BayId}! Displaced session {SessionId}; triggering live reroute from {LastNode}.",
+            "{Reason} {BayId}! Displaced session {SessionId}; triggering live reroute from {LastNode}.",
+            warningReason,
             bayId,
             displacedSession.VehicleSessionId,
             displacedSession.LastKnownNodeId);
@@ -340,22 +459,22 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             ct);
 
         var newSession = rerouteResult.Succeeded ? rerouteResult.Session : null;
-        await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Occupied, ct);
+        await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, resultingBayStatus, ct);
         await _eventSink.OnRouteReassignedAsync(bayId, displacedSession.VehicleSessionId, newSession, ct);
         _auditSink.TryEnqueue(new ParkingAuditEvent(
             _timeProvider.GetUtcNow(),
-            AuditEventType.IntrusionRerouted,
+            auditEventType,
             bayId,
             displacedSession.VehicleSessionId,
             newSession?.FencingToken,
             displacedSession.VehicleType,
             displacedSession.LastKnownNodeId,
-            newSession is not null ? $"reroutedBay={newSession.AssignedBayId};intruder={occupantSessionId}" : $"rerouteFailed;intruder={occupantSessionId}"));
+            newSession is not null ? rerouteSuccessDetails(newSession) : rerouteFailureDetails));
 
         return new PhysicalOccupancyResult(
             bayId,
-            BayStatus.Occupied,
-            WasIntruder: true,
+            resultingBayStatus,
+            WasIntruder: wasIntruder,
             DisplacedSessionId: displacedSession.VehicleSessionId,
             ReroutedSession: newSession);
     }

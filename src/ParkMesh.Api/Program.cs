@@ -289,6 +289,23 @@ app.MapPost("/api/parking/bays/{bayId}/occupancy", async (
     }
 }).AddEndpointFilter<ApiKeyEndpointFilter>();
 
+app.MapPatch("/api/parking/bays/{bayId}/maintenance", async (
+    string bayId,
+    MaintenanceApiRequest request,
+    IParkingAllocationService allocationService,
+    CancellationToken ct) =>
+{
+    try
+    {
+        var result = await allocationService.SetBayMaintenanceAsync(bayId, request.OutOfService, ct);
+        return Results.Ok(result);
+    }
+    catch (KeyNotFoundException)
+    {
+        return Results.NotFound(new { error = $"Bay '{bayId}' not found." });
+    }
+});
+
 app.MapGet("/api/parking/sessions", (IParkingAllocationService allocationService) =>
     Results.Ok(allocationService.GetActiveSessions()));
 
@@ -385,6 +402,8 @@ public sealed record AllocateSpotApiRequest(
 public sealed record PhysicalOccupancyApiRequest(
     bool Occupied,
     string? OccupantSessionId = null);
+
+public sealed record MaintenanceApiRequest(bool OutOfService);
 
 public sealed record VehicleProgressApiRequest(string CurrentNodeId);
 

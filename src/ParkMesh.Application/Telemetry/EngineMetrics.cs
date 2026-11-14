@@ -22,7 +22,8 @@ public sealed record EngineMetricsSnapshot(
     LatencyPercentiles AStarLatency,
     LatencyPercentiles RedisLeaseLatency,
     TelemetryMetricsSnapshot Telemetry,
-    long LeasesExpiredTotal = 0);
+    long LeasesExpiredTotal = 0,
+    int OutOfServiceBays = 0);
 
 public interface IEngineMetricsRecorder
 {
@@ -167,6 +168,7 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
         var free = 0;
         var leased = 0;
         var occupied = 0;
+        var outOfService = 0;
 
         foreach (var bay in graph.BaysById.Values)
         {
@@ -180,6 +182,9 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
                     break;
                 case BayStatus.Occupied:
                     occupied++;
+                    break;
+                case BayStatus.OutOfService:
+                    outOfService++;
                     break;
             }
         }
@@ -196,7 +201,8 @@ public sealed class EngineMetricsRecorder : IEngineMetricsRecorder, IDisposable
             _astarWindow.ComputePercentiles(),
             _redisWindow.ComputePercentiles(),
             telemetry,
-            Interlocked.Read(ref _leasesExpiredTotal));
+            Interlocked.Read(ref _leasesExpiredTotal),
+            outOfService);
     }
 
     public void Dispose() => _meter.Dispose();

@@ -331,6 +331,59 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         Assert.Equal(HttpStatusCode.TooManyRequests, limitedChaos.StatusCode);
     }
 
+    [Fact]
+    public async Task MaintenanceEndpoint_TogglesOutOfServiceAndReroutesDisplacedSession()
+    {
+        using var isolatedFactory = _factory.WithWebHostBuilder(_ => { });
+        using var client = isolatedFactory.CreateClient();
+
+        var readyResponse = await client.GetAsync("/health/ready");
+        Assert.Equal(HttpStatusCode.OK, readyResponse.StatusCode);
+        var readyJson = await readyResponse.Content.ReadFromJsonAsync<JsonElement>(JsonOptions);
+        Assert.True(readyJson.GetProperty("hydrated").GetBoolean());
+
+        var allocResponse = await client.PostAsJsonAsync(
+            "/api/parking/allocations",
+            new { GateId = "GATE-N1", VehicleSessionId = "CAR-MAINT-IT", VehicleType = VehicleType.Standard },
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.Created, allocResponse.StatusCode);
+        var allocated = await allocResponse.Content.ReadFromJsonAsync<AllocationEnvelope>(JsonOptions);
+        var targetBayId = allocated!.Session.AssignedBayId;
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var wsClient = isolatedFactory.Server.CreateWebSocketClient();
+        using var ws = await wsClient.ConnectAsync(new Uri("ws://localhost/hubs/parking"), cts.Token);
+        await SendSignalRMessageAsync(ws, """{"protocol":"json","version":1}""", cts.Token);
+        using var handshake = await ReceiveUntilAsync(ws, _ => true, cts.Token);
+
+        var maintResponse = await client.PatchAsJsonAsync(
+            $"/api/parking/bays/{targetBayId}/maintenance",
+            new { OutOfService = true },
+            JsonOptions,
+            cts.Token);
+        Assert.Equal(HttpStatusCode.OK, maintResponse.StatusCode);
+
+        var maintResult = await maintResponse.Content.ReadFromJsonAsync<PhysicalOccupancyResult>(JsonOptions, cts.Token);
+        Assert.NotNull(maintResult);
+        Assert.Equal(BayStatus.OutOfService, maintResult!.NewStatus);
+        Assert.Equal("CAR-MAINT-IT", maintResult.DisplacedSessionId);
+        Assert.NotNull(maintResult.ReroutedSession);
+        Assert.NotEqual(targetBayId, maintResult.ReroutedSession!.AssignedBayId);
+
+        using var routeReassignedDoc = await ReceiveUntilAsync(ws, doc => IsHubTarget(doc, "RouteReassigned"), cts.Token);
+        var payload = routeReassignedDoc.RootElement.GetProperty("arguments")[0];
+        Assert.Equal(targetBayId, payload.GetProperty("displacedBayId").GetString());
+        Assert.Equal("CAR-MAINT-IT", payload.GetProperty("displacedSessionId").GetString());
+
+        var restoreResponse = await client.PatchAsJsonAsync(
+            $"/api/parking/bays/{targetBayId}/maintenance",
+            new { OutOfService = false },
+            JsonOptions);
+        Assert.Equal(HttpStatusCode.OK, restoreResponse.StatusCode);
+        var restored = await restoreResponse.Content.ReadFromJsonAsync<PhysicalOccupancyResult>(JsonOptions);
+        Assert.Equal(BayStatus.Free, restored!.NewStatus);
+    }
+
     private static bool IsHubTarget(JsonDocument doc, string targetName) =>
         doc.RootElement.TryGetProperty("type", out var t)
         && t.GetInt32() == 1

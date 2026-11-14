@@ -35,10 +35,11 @@
           <span class="legend-item"><i class="swatch free"></i>Free</span>
           <span class="legend-item"><i class="swatch leased"></i>Leased (90s)</span>
           <span class="legend-item"><i class="swatch occupied"></i>Occupied</span>
+          <span class="legend-item"><i class="swatch maintenance"></i>Out of Service</span>
           <span class="legend-item"><i class="swatch car"></i>Active Vehicle</span>
           <span class="legend-item"><i class="swatch led"></i>LED Panel</span>
         </div>
-        <span class="canvas-hint" id="canvasFloorTitle">Viewing Floor 0 — 40 Bays · 2 Entry Gates</span>
+        <span class="canvas-hint" id="canvasFloorTitle">Viewing Floor 0 — 40 Bays · Click any bay to toggle maintenance</span>
       </div>
       <div class="canvas-wrap">
         <canvas id="garageCanvas"></canvas>
@@ -94,7 +95,7 @@
           <div><span>A* P50 / P95 / P99</span><strong id="astarLatency">0 / 0 / 0 ms</strong></div>
           <div><span>Redis Lease P50 / P95</span><strong id="redisLatency">0 / 0 ms</strong></div>
           <div><span>MQTT Channel (Enq / Conf)</span><strong id="channelStats">0 / 0</strong></div>
-          <div><span>Bay States (F / L / O)</span><strong id="bayCounts">120 / 0 / 0</strong></div>
+          <div><span>Bay States (F / L / O / M)</span><strong id="bayCounts">120 / 0 / 0 / 0</strong></div>
         </div>
       </section>
 
@@ -102,6 +103,17 @@
         <h2>Live Domain Event Stream</h2>
         <ul class="event-feed" id="eventFeed"></ul>
       </section>
+
+      <details class="card audit-card" id="auditDrawer">
+        <summary class="audit-summary">
+          <span>Durable Audit Log <span class="badge" id="auditCountBadge">0</span></span>
+          <span class="audit-meta" id="auditDroppedLabel">dropped: 0</span>
+        </summary>
+        <div class="audit-toolbar">
+          <button class="btn toggle small" type="button" id="auditRefreshBtn">Refresh</button>
+        </div>
+        <ul class="audit-list" id="auditList"></ul>
+      </details>
     </aside>
   </main>
 

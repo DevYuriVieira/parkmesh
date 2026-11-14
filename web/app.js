@@ -11,7 +11,8 @@ const state = {
   autoDemo: false,
   demoTimer: null,
   demoSeq: 1,
-  demoCounter: 1
+  demoCounter: 1,
+  hoveredBayId: null
 };
 
 const canvas = document.getElementById("garageCanvas");
@@ -33,12 +34,14 @@ client.on("RouteAssigned", (session) => {
 });
 
 client.on("RouteReassigned", (payload) => {
+  const displacedBay = state.baysById.get(payload.displacedBayId);
+  const trigger = displacedBay?.status === "OutOfService" ? "MAINT" : "INTRUDER";
   if (payload.newSession) {
     upsertSession(payload.newSession, true);
-    logEvent(`INTRUDER on ${payload.displacedBayId}! Rerouted ${payload.displacedSessionId} -> ${payload.newSession.assignedBayId}`, "reroute");
+    logEvent(`${trigger} on ${payload.displacedBayId}! Rerouted ${payload.displacedSessionId} -> ${payload.newSession.assignedBayId}`, "reroute");
   } else {
     state.sessions.delete(payload.displacedSessionId);
-    logEvent(`INTRUDER on ${payload.displacedBayId}! No alternative bay available for ${payload.displacedSessionId}`, "reroute");
+    logEvent(`${trigger} on ${payload.displacedBayId}! No alternative bay available for ${payload.displacedSessionId}`, "reroute");
   }
 });
 
@@ -50,14 +53,15 @@ client.on("BayStateChanged", (delta) => {
   bay.currentSessionId = delta.sessionId;
   bay.leaseExpiresAtUtc = delta.leaseExpiresAtUtc;
 
-  if (delta.status === "Occupied" || delta.status === "Free") {
-    if (delta.status === "Free") {
-      for (const [sid, s] of state.sessions.entries()) {
-        if (s.assignedBayId === delta.bayId) {
-          state.sessions.delete(sid);
-        }
+  if (delta.status === "Free" || delta.status === "OutOfService") {
+    for (const [sid, s] of state.sessions.entries()) {
+      if (s.assignedBayId === delta.bayId) {
+        state.sessions.delete(sid);
       }
     }
+  }
+
+  if (delta.status === "Occupied" || delta.status === "Free" || delta.status === "OutOfService") {
     logEvent(`Bay ${delta.bayId} -> ${delta.status}`, delta.status.toLowerCase());
   }
 
@@ -172,7 +176,43 @@ function renderMetrics(m) {
   document.getElementById("channelStats").textContent =
     `${m.telemetry.enqueuedCount} / ${m.telemetry.confirmedTransitionsCount}`;
   document.getElementById("bayCounts").textContent =
-    `${m.freeBays} / ${m.leasedBays} / ${m.occupiedBays}`;
+    `${m.freeBays} / ${m.leasedBays} / ${m.occupiedBays} / ${m.outOfServiceBays ?? 0}`;
+}
+
+function getCanvasLayout() {
+  const width = canvas.clientWidth;
+  const height = canvas.clientHeight;
+  const padX = 48;
+  const padY = 42;
+  const scaleX = (width - padX * 2) / 100;
+  const scaleY = (height - padY * 2) / 60;
+  return {
+    width,
+    height,
+    scaleX,
+    scaleY,
+    boxW: Math.max(24, scaleX * 3.8),
+    boxH: Math.max(18, scaleY * 3.8),
+    toX: (x) => padX + x * scaleX,
+    toY: (y) => padY + y * scaleY
+  };
+}
+
+function findBayAtCanvasPoint(canvasX, canvasY) {
+  const layout = getCanvasLayout();
+  const halfW = layout.boxW / 2;
+  const halfH = layout.boxH / 2;
+
+  for (const bay of state.baysById.values()) {
+    if (bay.floor !== state.selectedFloor) continue;
+    const bx = layout.toX(bay.x);
+    const by = layout.toY(bay.y);
+    if (Math.abs(canvasX - bx) <= halfW && Math.abs(canvasY - by) <= halfH) {
+      return bay;
+    }
+  }
+
+  return null;
 }
 
 function resizeCanvas() {
@@ -184,16 +224,9 @@ function resizeCanvas() {
 }
 
 function drawFrame(now) {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
+  const layout = getCanvasLayout();
+  const { width, height, toX, toY, boxW, boxH } = layout;
   ctx.clearRect(0, 0, width, height);
-
-  const padX = 48;
-  const padY = 42;
-  const scaleX = (width - padX * 2) / 100;
-  const scaleY = (height - padY * 2) / 60;
-  const toX = (x) => padX + x * scaleX;
-  const toY = (y) => padY + y * scaleY;
 
   const floor = state.selectedFloor;
 
@@ -241,26 +274,42 @@ function drawFrame(now) {
 
     const bx = toX(bay.x);
     const by = toY(bay.y);
-    const boxW = Math.max(24, scaleX * 3.8);
-    const boxH = Math.max(18, scaleY * 3.8);
+    const isMaintenance = bay.status === "OutOfService";
+    const isHovered = state.hoveredBayId === bay.bayId;
 
     const fill = bay.status === "Free"
       ? "rgba(16, 185, 129, 0.22)"
       : bay.status === "Leased"
         ? "rgba(245, 158, 11, 0.30)"
-        : "rgba(239, 68, 68, 0.34)";
+        : isMaintenance
+          ? "rgba(100, 116, 139, 0.28)"
+          : "rgba(239, 68, 68, 0.34)";
 
-    const stroke = bay.status === "Free"
-      ? "#10b981"
-      : bay.status === "Leased"
-        ? "#f59e0b"
-        : "#ef4444";
+    const stroke = isHovered
+      ? "#f8fafc"
+      : bay.status === "Free"
+        ? "#10b981"
+        : bay.status === "Leased"
+          ? "#f59e0b"
+          : isMaintenance
+            ? "#94a3b8"
+            : "#ef4444";
 
     ctx.fillStyle = fill;
     ctx.strokeStyle = stroke;
-    ctx.lineWidth = 1.6;
+    ctx.lineWidth = isHovered ? 2.4 : 1.6;
+    if (isMaintenance) ctx.setLineDash([3, 3]);
     ctx.fillRect(bx - boxW / 2, by - boxH / 2, boxW, boxH);
     ctx.strokeRect(bx - boxW / 2, by - boxH / 2, boxW, boxH);
+    if (isMaintenance) {
+      ctx.setLineDash([]);
+      ctx.beginPath();
+      ctx.moveTo(bx - boxW / 2 + 2, by - boxH / 2 + 2);
+      ctx.lineTo(bx + boxW / 2 - 2, by + boxH / 2 - 2);
+      ctx.strokeStyle = "rgba(148, 163, 184, 0.5)";
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
 
     ctx.fillStyle = "#e2e8f0";
     ctx.font = "bold 9px Inter, sans-serif";
@@ -269,9 +318,11 @@ function drawFrame(now) {
 
     ctx.fillStyle = "#94a3b8";
     ctx.font = "8px Inter, sans-serif";
-    const tag = bay.status === "Leased" && bay.leaseExpiresAtUtc
-      ? `${Math.max(0, Math.ceil((Date.parse(bay.leaseExpiresAtUtc) - Date.now()) / 1000))}s`
-      : bay.primaryType.toUpperCase();
+    const tag = isMaintenance
+      ? "MAINT"
+      : bay.status === "Leased" && bay.leaseExpiresAtUtc
+        ? `${Math.max(0, Math.ceil((Date.parse(bay.leaseExpiresAtUtc) - Date.now()) / 1000))}s`
+        : bay.primaryType.toUpperCase();
     ctx.fillText(tag, bx, by + 9);
   }
 
@@ -439,11 +490,95 @@ document.getElementById("floorTabs").addEventListener("click", (e) => {
   const btn = e.target.closest(".floor-tab");
   if (!btn) return;
   state.selectedFloor = Number(btn.dataset.floor);
+  state.hoveredBayId = null;
   for (const el of document.querySelectorAll(".floor-tab")) {
     el.classList.toggle("active", Number(el.dataset.floor) === state.selectedFloor);
   }
-  document.getElementById("canvasFloorTitle").textContent =
-    `Viewing Floor ${state.selectedFloor} — 40 Bays${state.selectedFloor === 0 ? " · 2 Entry Gates" : " · Ramp Access"}`;
+  updateFloorHint();
+});
+
+function updateFloorHint(hoveredBay = null) {
+  const titleEl = document.getElementById("canvasFloorTitle");
+  if (hoveredBay) {
+    const nextAction = hoveredBay.status === "OutOfService" ? "restore Free" : "mark OutOfService";
+    titleEl.textContent = `Bay ${hoveredBay.bayId} (${hoveredBay.status}) — Click to ${nextAction}`;
+    return;
+  }
+
+  titleEl.textContent =
+    `Viewing Floor ${state.selectedFloor} — 40 Bays${state.selectedFloor === 0 ? " · 2 Entry Gates" : " · Ramp Access"} · Click any bay to toggle maintenance`;
+}
+
+async function loadAuditEvents() {
+  const res = await fetch("/api/parking/audit?limit=25");
+  if (!res.ok) return;
+
+  const data = await res.json();
+  document.getElementById("auditCountBadge").textContent = String(data.count ?? 0);
+  document.getElementById("auditDroppedLabel").textContent = `dropped: ${data.droppedCount ?? 0}`;
+
+  const list = document.getElementById("auditList");
+  list.replaceChildren();
+  for (const ev of data.events || []) {
+    const li = document.createElement("li");
+    const ts = new Date(ev.occurredAtUtc).toLocaleTimeString([], { hour12: false });
+    const left = document.createElement("span");
+    left.textContent = `${ev.eventType} · ${ev.bayId}${ev.sessionId ? ` (${ev.sessionId})` : ""}`;
+    const right = document.createElement("span");
+    right.className = "muted";
+    right.textContent = ts;
+    li.append(left, right);
+    list.append(li);
+  }
+}
+
+async function toggleBayMaintenance(bay) {
+  const outOfService = bay.status !== "OutOfService";
+  const res = await fetch(`/api/parking/bays/${encodeURIComponent(bay.bayId)}/maintenance`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outOfService })
+  });
+  if (res.ok && document.getElementById("auditDrawer").open) {
+    await loadAuditEvents();
+  }
+}
+
+canvas.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const bay = findBayAtCanvasPoint(e.clientX - rect.left, e.clientY - rect.top);
+  const nextId = bay ? bay.bayId : null;
+  if (state.hoveredBayId !== nextId) {
+    state.hoveredBayId = nextId;
+    canvas.style.cursor = bay ? "pointer" : "default";
+    updateFloorHint(bay);
+  }
+});
+
+canvas.addEventListener("mouseleave", () => {
+  if (state.hoveredBayId !== null) {
+    state.hoveredBayId = null;
+    canvas.style.cursor = "default";
+    updateFloorHint();
+  }
+});
+
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const bay = findBayAtCanvasPoint(e.clientX - rect.left, e.clientY - rect.top);
+  if (bay) {
+    toggleBayMaintenance(bay).catch(console.error);
+  }
+});
+
+const auditDrawer = document.getElementById("auditDrawer");
+auditDrawer.addEventListener("toggle", () => {
+  if (auditDrawer.open) {
+    loadAuditEvents().catch(console.error);
+  }
+});
+document.getElementById("auditRefreshBtn").addEventListener("click", () => {
+  loadAuditEvents().catch(console.error);
 });
 
 document.getElementById("spawnBtn").addEventListener("click", () => spawnVehicle().catch(console.error));
