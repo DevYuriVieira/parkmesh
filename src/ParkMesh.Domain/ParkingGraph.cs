@@ -60,4 +60,17 @@ public sealed class ParkingGraph
 
     public IReadOnlyList<GraphEdge> GetOutgoingEdges(string nodeId) =>
         _adjacency.TryGetValue(nodeId, out var edges) ? edges : Array.Empty<GraphEdge>();
+
+    public ParkingGraph CloneTopology() =>
+        new(
+            _nodes.Values,
+            _edges,
+            _baysById.Values.Select(b => new ParkingBay(
+                b.BayId,
+                b.NodeId,
+                b.Floor,
+                b.X,
+                b.Y,
+                b.PrimaryType,
+                b.AllowedTypes)));
 }

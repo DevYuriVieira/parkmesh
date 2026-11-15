@@ -109,6 +109,12 @@ Microbenchmark numbers (`BenchmarkDotNet v0.15.8`, `.NET 10.0.11`, in-process sh
 | `TelemetryFilter_EvaluateReading` | ~58.7 ns (72 B) | `64.53 ns` | `72 B` |
 | `SlidingWindow_Compute1024Percentiles` | ~9.21 us (~8.1 KB) | `6.74 us` | `8,264 B` |
 
+## Security Model and Known Scope Limits
+
+- **Tenant Model:** Each tenant identifier (`X-Tenant-Id`, or `?tenantId=` on `/hubs/parking`) isolates an independent virtual garage instance (`ParkingGraph`, edge congestion, Redis lease namespace, PostgreSQL RLS audit rows, and SignalR group `tenant:{id}`). In demo/standalone mode (`Security:AllowedTenants` empty), callers self-declare `X-Tenant-Id`. When strong tenant authentication is needed across untrusted callers, pair `Security:ApiKey` / `Security:AllowedTenants` with upstream JWT/claim termination rather than trusting raw headers.
+- **Production Fail-Closed Defaults:** Outside `Development`, startup fails if `Security:ApiKey` is empty (unless `Security:AllowUnauthenticatedProduction=true`), and `/api/parking/chaos/*` routes remain unmapped unless `Security:EnableChaosEndpoints=true`.
+- **Local Compose & MQTT Telemetry:** `infra/docker-compose.yml` configures `ASPNETCORE_ENVIRONMENT=Development` with local dev credentials and open ports strictly for local demos. Background MQTT telemetry ingestion targets the `default` tenant graph.
+
 ## Documentation
 
 - [Architecture Blueprint](docs/ARCHITECTURE.md)

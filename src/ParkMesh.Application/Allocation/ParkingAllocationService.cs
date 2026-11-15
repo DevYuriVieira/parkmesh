@@ -43,16 +43,17 @@ public interface IParkingAllocationService
 
     Task<int> RehydrateStateAsync(IEnumerable<string> tenantIds, CancellationToken ct = default) =>
         RehydrateStateAsync(ct);
+
+    IReadOnlyCollection<string> GetKnownTenants() => [TenantDefaults.DefaultTenantId];
 }
 
 public sealed class ParkingAllocationService : IParkingAllocationService
 {
     private static readonly TimeSpan DefaultLeaseTtl = TimeSpan.FromSeconds(90);
 
-    private readonly ParkingGraph _graph;
+    private readonly ParkingGraph _graphTemplate;
     private readonly IPathfinder _pathfinder;
     private readonly IBayLeaseManager _leaseManager;
-    private readonly IEdgeCongestionTracker _congestionTracker;
     private readonly ILedPanelPublisher _ledPublisher;
     private readonly IParkingEventSink _eventSink;
     private readonly IEngineMetricsRecorder _metrics;
@@ -62,8 +63,14 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     private readonly TimeProvider _timeProvider;
     private readonly ILogger<ParkingAllocationService> _logger;
     private readonly ConcurrentDictionary<SessionKey, ActiveVehicleSession> _sessions = new(SessionKeyComparer.Instance);
-    private readonly ConcurrentDictionary<string, string> _bayTenants = new(StringComparer.OrdinalIgnoreCase);
-    private readonly Lock _stateLock = new();
+    private readonly ConcurrentDictionary<string, TenantRuntime> _tenants = new(StringComparer.Ordinal);
+
+    private sealed class TenantRuntime(ParkingGraph graph, IEdgeCongestionTracker congestion)
+    {
+        public ParkingGraph Graph { get; } = graph;
+        public IEdgeCongestionTracker Congestion { get; } = congestion;
+        public Lock StateLock { get; } = new();
+    }
 
     private readonly record struct SessionKey(string TenantId, string VehicleSessionId);
 
@@ -98,10 +105,9 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         IParkingAuditStore? auditStore = null,
         ITenantContext? tenantContext = null)
     {
-        _graph = graph;
+        _graphTemplate = graph;
         _pathfinder = pathfinder;
         _leaseManager = leaseManager;
-        _congestionTracker = congestionTracker;
         _logger = logger;
         _ledPublisher = ledPublisher ?? NullLedPanelPublisher.Instance;
         _eventSink = eventSink ?? NullParkingEventSink.Instance;
@@ -110,9 +116,17 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         _auditSink = auditSink ?? NullParkingAuditSink.Instance;
         _auditStore = auditStore ?? NullParkingAuditStore.Instance;
         _tenantContext = tenantContext ?? DefaultTenantContext.Instance;
+        _tenants[TenantDefaults.DefaultTenantId] = new TenantRuntime(graph, congestionTracker);
     }
 
-    public ParkingGraph Graph => _graph;
+    public ParkingGraph Graph => GetRuntime(_tenantContext.CurrentTenantId).Graph;
+
+    public IReadOnlyCollection<string> GetKnownTenants() => _tenants.Keys.ToArray();
+
+    private TenantRuntime GetRuntime(string tenantId) =>
+        _tenants.GetOrAdd(
+            tenantId,
+            _ => new TenantRuntime(_graphTemplate.CloneTopology(), new InMemoryEdgeCongestionTracker()));
 
     public async Task<AllocateSpotResult> AllocateAsync(AllocateSpotRequest request, CancellationToken ct = default)
     {
@@ -120,7 +134,10 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         ArgumentException.ThrowIfNullOrWhiteSpace(request.StartNodeId);
         ArgumentException.ThrowIfNullOrWhiteSpace(request.VehicleSessionId);
 
-        if (!_graph.TryGetNode(request.StartNodeId, out _))
+        var currentTenant = _tenantContext.CurrentTenantId;
+        var runtime = GetRuntime(currentTenant);
+
+        if (!runtime.Graph.TryGetNode(request.StartNodeId, out _))
         {
             return new AllocateSpotResult(false, FailureReason: $"Unknown start node '{request.StartNodeId}'.");
         }
@@ -128,10 +145,10 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         using var activity = EngineMetricsRecorder.ActivitySource.StartActivity("parkmesh.allocate");
         activity?.SetTag("parkmesh.gate_id", request.StartNodeId);
         activity?.SetTag("parkmesh.vehicle_type", request.VehicleType.ToString());
+        activity?.SetTag("parkmesh.tenant_id", currentTenant);
 
         const int initialCandidateBatchSize = 15;
         var sw = Stopwatch.StartNew();
-        var currentTenant = _tenantContext.CurrentTenantId;
         var sessionKey = new SessionKey(currentTenant, request.VehicleSessionId);
 
         // Idempotency & conflict guard: if the caller retries the exact same session
@@ -139,11 +156,11 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         // the existing allocation instead of grabbing a second bay. If parameters differ,
         // reject with a conflict so one session cannot hold two bays.
         if (_sessions.TryGetValue(sessionKey, out var existing) &&
-            _graph.TryGetBay(existing.AssignedBayId, out var existingBay))
+            runtime.Graph.TryGetBay(existing.AssignedBayId, out var existingBay))
         {
             var now = _timeProvider.GetUtcNow();
             bool stillActive;
-            lock (_stateLock)
+            lock (runtime.StateLock)
             {
                 stillActive = existingBay.Status == BayStatus.Leased
                     && string.Equals(existingBay.CurrentSessionId, request.VehicleSessionId, StringComparison.OrdinalIgnoreCase)
@@ -177,17 +194,17 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         {
             ct.ThrowIfCancellationRequested();
 
-            var congestionSnapshot = _congestionTracker.Snapshot();
+            var congestionSnapshot = runtime.Congestion.Snapshot();
             var requestedCandidates = exhaustedBays is null
                 ? initialCandidateBatchSize
-                : Math.Min(_graph.BaysById.Count, exhaustedBays.Count + initialCandidateBatchSize);
+                : Math.Min(runtime.Graph.BaysById.Count, exhaustedBays.Count + initialCandidateBatchSize);
 
             var astarSw = Stopwatch.StartNew();
             IReadOnlyList<ParkingRoute> candidates;
-            lock (_stateLock)
+            lock (runtime.StateLock)
             {
                 candidates = _pathfinder.FindCandidateBayRoutes(
-                    _graph,
+                    runtime.Graph,
                     request.StartNodeId,
                     request.VehicleType,
                     congestionSnapshot,
@@ -239,9 +256,9 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 var allocatedAt = _timeProvider.GetUtcNow();
                 var expiresAt = lease.ExpiresAtUtc ?? allocatedAt.Add(ttl);
                 bool committedLocally;
-                lock (_stateLock)
+                lock (runtime.StateLock)
                 {
-                    var bay = _graph.BaysById[candidateRoute.TargetBayId];
+                    var bay = runtime.Graph.BaysById[candidateRoute.TargetBayId];
                     committedLocally = bay.TrySetLeased(request.VehicleSessionId, lease.FencingToken, expiresAt);
                 }
 
@@ -265,8 +282,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                     currentTenant);
 
                 _sessions[sessionKey] = session;
-                _bayTenants[candidateRoute.TargetBayId] = currentTenant;
-                _congestionTracker.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
+                runtime.Congestion.AddRouteLoad(candidateRoute.Steps.Select(s => s.EdgeId));
                 _metrics.RecordAllocation();
                 activity?.SetTag("parkmesh.bay_id", candidateRoute.TargetBayId);
                 activity?.SetTag("parkmesh.fencing_token", lease.FencingToken);
@@ -295,7 +311,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 return new AllocateSpotResult(true, session, ComputationTimeMs: sw.Elapsed.TotalMilliseconds);
             }
 
-            if (!attemptedNewCandidate || (exhaustedBays?.Count ?? 0) >= _graph.BaysById.Count)
+            if (!attemptedNewCandidate || (exhaustedBays?.Count ?? 0) >= runtime.Graph.BaysById.Count)
                 break;
         }
 
@@ -308,7 +324,10 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
     public async Task<bool> ReleaseLeaseAsync(string bayId, long fencingToken, CancellationToken ct = default)
     {
-        if (!_graph.TryGetBay(bayId, out var bay))
+        var currentTenant = _tenantContext.CurrentTenantId;
+        var runtime = GetRuntime(currentTenant);
+
+        if (!runtime.Graph.TryGetBay(bayId, out var bay))
             return false;
 
         var releasedInRedis = await _leaseManager.TryReleaseLeaseAsync(bayId, fencingToken, ct);
@@ -316,24 +335,19 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             return false;
 
         ActiveVehicleSession? removedSession = null;
-        var currentTenant = _tenantContext.CurrentTenantId;
-        lock (_stateLock)
+        lock (runtime.StateLock)
         {
             if (bay.CurrentSessionId is not null && bay.FencingToken == fencingToken)
             {
-                var ownerTenant = _bayTenants.GetValueOrDefault(bayId, currentTenant);
-                _sessions.TryRemove(new SessionKey(ownerTenant, bay.CurrentSessionId), out removedSession);
+                _sessions.TryRemove(new SessionKey(currentTenant, bay.CurrentSessionId), out removedSession);
             }
 
-            if (bay.TryReleaseLease(fencingToken))
-            {
-                _bayTenants.TryRemove(bayId, out _);
-            }
+            bay.TryReleaseLease(fencingToken);
         }
 
         if (removedSession is not null)
         {
-            _congestionTracker.RemoveRouteLoad(removedSession.Route.Steps.Select(s => s.EdgeId));
+            runtime.Congestion.RemoveRouteLoad(removedSession.Route.Steps.Select(s => s.EdgeId));
         }
 
         EnqueueAudit(
@@ -355,33 +369,27 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         string? occupantSessionId = null,
         CancellationToken ct = default)
     {
-        if (!_graph.TryGetBay(bayId, out var bay))
+        var currentTenant = _tenantContext.CurrentTenantId;
+        var runtime = GetRuntime(currentTenant);
+
+        if (!runtime.Graph.TryGetBay(bayId, out var bay))
             throw new KeyNotFoundException($"Unknown bay '{bayId}'.");
 
         if (!occupied)
         {
             ActiveVehicleSession? departed = null;
-            string leaseTenant;
-            lock (_stateLock)
+            lock (runtime.StateLock)
             {
-                leaseTenant = _bayTenants.TryGetValue(bayId, out var trackedTenant)
-                    ? trackedTenant
-                    : _tenantContext.CurrentTenantId;
-
                 if (bay.CurrentSessionId is not null)
-                    _sessions.TryRemove(new SessionKey(leaseTenant, bay.CurrentSessionId), out departed);
+                    _sessions.TryRemove(new SessionKey(currentTenant, bay.CurrentSessionId), out departed);
 
-                _bayTenants.TryRemove(bayId, out _);
                 bay.MarkFree();
             }
 
-            using (_tenantContext.BeginScope(leaseTenant))
-            {
-                await _leaseManager.InvalidateLeaseAsync(bayId, ct);
-            }
+            await _leaseManager.InvalidateLeaseAsync(bayId, ct);
 
             if (departed is not null)
-                _congestionTracker.RemoveRouteLoad(departed.Route.Steps.Select(s => s.EdgeId));
+                runtime.Congestion.RemoveRouteLoad(departed.Route.Steps.Select(s => s.EdgeId));
 
             await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, BayStatus.Free, ct);
             EnqueueAudit(
@@ -393,44 +401,35 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                 departed?.VehicleType,
                 departed?.LastKnownNodeId,
                 null,
-                departed?.TenantId);
+                currentTenant);
 
             return new PhysicalOccupancyResult(bayId, BayStatus.Free, false, null, null);
         }
 
         ActiveVehicleSession? displacedSession = null;
-        string occupiedLeaseTenant;
         var wasIntruder = false;
 
-        lock (_stateLock)
+        lock (runtime.StateLock)
         {
-            occupiedLeaseTenant = _bayTenants.TryGetValue(bayId, out var trackedTenant)
-                ? trackedTenant
-                : _tenantContext.CurrentTenantId;
-
             if (bay.Status == BayStatus.Leased &&
                 bay.CurrentSessionId is not null &&
                 !string.Equals(bay.CurrentSessionId, occupantSessionId, StringComparison.OrdinalIgnoreCase))
             {
                 wasIntruder = true;
-                _sessions.TryRemove(new SessionKey(occupiedLeaseTenant, bay.CurrentSessionId), out displacedSession);
+                _sessions.TryRemove(new SessionKey(currentTenant, bay.CurrentSessionId), out displacedSession);
             }
             else if (bay.CurrentSessionId is not null &&
                      string.Equals(bay.CurrentSessionId, occupantSessionId, StringComparison.OrdinalIgnoreCase))
             {
-                _sessions.TryRemove(new SessionKey(occupiedLeaseTenant, bay.CurrentSessionId), out var arrivedSession);
+                _sessions.TryRemove(new SessionKey(currentTenant, bay.CurrentSessionId), out var arrivedSession);
                 if (arrivedSession is not null)
-                    _congestionTracker.RemoveRouteLoad(arrivedSession.Route.Steps.Select(s => s.EdgeId));
+                    runtime.Congestion.RemoveRouteLoad(arrivedSession.Route.Steps.Select(s => s.EdgeId));
             }
 
-            _bayTenants.TryRemove(bayId, out _);
             bay.MarkOccupied(occupantSessionId);
         }
 
-        using (_tenantContext.BeginScope(occupiedLeaseTenant))
-        {
-            await _leaseManager.InvalidateLeaseAsync(bayId, ct);
-        }
+        await _leaseManager.InvalidateLeaseAsync(bayId, ct);
 
         if (!wasIntruder || displacedSession is null)
         {
@@ -466,14 +465,17 @@ public sealed class ParkingAllocationService : IParkingAllocationService
     {
         ArgumentException.ThrowIfNullOrWhiteSpace(bayId);
 
-        if (!_graph.TryGetBay(bayId, out var bay))
+        var currentTenant = _tenantContext.CurrentTenantId;
+        var runtime = GetRuntime(currentTenant);
+
+        if (!runtime.Graph.TryGetBay(bayId, out var bay))
             throw new KeyNotFoundException($"Unknown bay '{bayId}'.");
 
         if (!outOfService)
         {
             var restored = false;
             BayStatus resultingStatus;
-            lock (_stateLock)
+            lock (runtime.StateLock)
             {
                 if (bay.Status == BayStatus.OutOfService)
                 {
@@ -502,30 +504,21 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         }
 
         ActiveVehicleSession? displacedSession = null;
-        string maintLeaseTenant;
         var changed = false;
 
-        lock (_stateLock)
+        lock (runtime.StateLock)
         {
             if (bay.Status == BayStatus.OutOfService)
                 return new PhysicalOccupancyResult(bayId, BayStatus.OutOfService, false, null, null);
 
-            maintLeaseTenant = _bayTenants.TryGetValue(bayId, out var trackedTenant)
-                ? trackedTenant
-                : _tenantContext.CurrentTenantId;
-
             if (bay.CurrentSessionId is not null)
-                _sessions.TryRemove(new SessionKey(maintLeaseTenant, bay.CurrentSessionId), out displacedSession);
+                _sessions.TryRemove(new SessionKey(currentTenant, bay.CurrentSessionId), out displacedSession);
 
-            _bayTenants.TryRemove(bayId, out _);
             bay.MarkOutOfService();
             changed = true;
         }
 
-        using (_tenantContext.BeginScope(maintLeaseTenant))
-        {
-            await _leaseManager.InvalidateLeaseAsync(bayId, ct);
-        }
+        await _leaseManager.InvalidateLeaseAsync(bayId, ct);
 
         if (displacedSession is not null)
         {
@@ -569,7 +562,8 @@ public sealed class ParkingAllocationService : IParkingAllocationService
         string warningReason,
         CancellationToken ct)
     {
-        _congestionTracker.RemoveRouteLoad(displacedSession.Route.Steps.Select(s => s.EdgeId));
+        var runtime = GetRuntime(displacedSession.TenantId);
+        runtime.Congestion.RemoveRouteLoad(displacedSession.Route.Steps.Select(s => s.EdgeId));
 
         _logger.LogWarning(
             "{Reason} {BayId}! Displaced session {SessionId}; triggering live reroute from {LastNode}.",
@@ -580,6 +574,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
         _metrics.RecordReroute();
         AllocateSpotResult rerouteResult;
+        ActiveVehicleSession? newSession;
         using (_tenantContext.BeginScope(displacedSession.TenantId))
         {
             rerouteResult = await AllocateAsync(
@@ -588,11 +583,11 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                     displacedSession.VehicleSessionId,
                     displacedSession.VehicleType),
                 ct);
-        }
 
-        var newSession = rerouteResult.Succeeded ? rerouteResult.Session : null;
-        await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, resultingBayStatus, ct);
-        await _eventSink.OnRouteReassignedAsync(bayId, displacedSession.VehicleSessionId, newSession, ct);
+            newSession = rerouteResult.Succeeded ? rerouteResult.Session : null;
+            await _eventSink.OnPhysicalOccupancyChangedAsync(bayId, resultingBayStatus, ct);
+            await _eventSink.OnRouteReassignedAsync(bayId, displacedSession.VehicleSessionId, newSession, ct);
+        }
         EnqueueAudit(
             _timeProvider.GetUtcNow(),
             auditEventType,
@@ -614,10 +609,12 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
     public bool UpdateVehicleProgress(string vehicleSessionId, string currentNodeId)
     {
-        if (!_graph.TryGetNode(currentNodeId, out _))
+        var currentTenant = _tenantContext.CurrentTenantId;
+        var runtime = GetRuntime(currentTenant);
+        if (!runtime.Graph.TryGetNode(currentNodeId, out _))
             return false;
 
-        var key = new SessionKey(_tenantContext.CurrentTenantId, vehicleSessionId);
+        var key = new SessionKey(currentTenant, vehicleSessionId);
         if (!_sessions.TryGetValue(key, out var current))
             return false;
 
@@ -658,23 +655,23 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
             ActiveVehicleSession? purged = null;
             var key = new SessionKey(candidate.TenantId, candidate.VehicleSessionId);
-            lock (_stateLock)
+            var runtime = GetRuntime(candidate.TenantId);
+            lock (runtime.StateLock)
             {
                 if (_sessions.TryGetValue(key, out var current)
                     && current.FencingToken == candidate.FencingToken
                     && current.ExpiresAtUtc <= now
-                    && _graph.TryGetBay(current.AssignedBayId, out var bay)
+                    && runtime.Graph.TryGetBay(current.AssignedBayId, out var bay)
                     && bay.TryReleaseLease(current.FencingToken))
                 {
                     _sessions.TryRemove(key, out purged);
-                    _bayTenants.TryRemove(current.AssignedBayId, out _);
                 }
             }
 
             if (purged is null)
                 continue;
 
-            _congestionTracker.RemoveRouteLoad(purged.Route.Steps.Select(s => s.EdgeId));
+            runtime.Congestion.RemoveRouteLoad(purged.Route.Steps.Select(s => s.EdgeId));
             using (_tenantContext.BeginScope(purged.TenantId))
             {
                 await _leaseManager.TryReleaseLeaseAsync(purged.AssignedBayId, purged.FencingToken, ct);
@@ -725,13 +722,15 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
         var totalRestored = 0;
         var totalLeases = 0;
-        var defaultGateId = _graph.Gates.FirstOrDefault()?.Id;
-        var bayIds = _graph.BaysById.Keys.ToArray();
         var now = _timeProvider.GetUtcNow();
 
         foreach (var tenantId in distinctTenants)
         {
             ct.ThrowIfCancellationRequested();
+
+            var runtime = GetRuntime(tenantId);
+            var defaultGateId = runtime.Graph.Gates.FirstOrDefault()?.Id;
+            var bayIds = runtime.Graph.BaysById.Keys.ToArray();
 
             IReadOnlyDictionary<string, AuditEventType> physicalStates;
             IReadOnlyList<ActiveLeaseSnapshot> activeLeases;
@@ -764,19 +763,19 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
             foreach (var lease in activeLeases)
             {
-                if (!_graph.TryGetBay(lease.BayId, out var bay))
+                if (!runtime.Graph.TryGetBay(lease.BayId, out var bay))
                     continue;
 
                 ParkingAuditEvent? allocEvent = null;
                 allocationAuditByLease?.TryGetValue((lease.BayId, lease.FencingToken), out allocEvent);
 
-                var startNodeId = allocEvent?.NodeId is not null && _graph.TryGetNode(allocEvent.NodeId, out _)
+                var startNodeId = allocEvent?.NodeId is not null && runtime.Graph.TryGetNode(allocEvent.NodeId, out _)
                     ? allocEvent.NodeId
                     : defaultGateId ?? bay.NodeId;
 
                 var vehicleType = allocEvent?.VehicleType ?? bay.PrimaryType;
-                var route = _pathfinder.FindShortestPath(_graph, startNodeId, bay.BayId)
-                    ?? _pathfinder.FindShortestPath(_graph, bay.NodeId, bay.BayId);
+                var route = _pathfinder.FindShortestPath(runtime.Graph, startNodeId, bay.BayId)
+                    ?? _pathfinder.FindShortestPath(runtime.Graph, bay.NodeId, bay.BayId);
 
                 if (route is null)
                     continue;
@@ -787,11 +786,11 @@ public sealed class ParkingAllocationService : IParkingAllocationService
             var restoredSessions = new List<ActiveVehicleSession>(precomputedRoutes.Count);
             var restoredForTenant = 0;
 
-            lock (_stateLock)
+            lock (runtime.StateLock)
             {
                 foreach (var (bayId, eventType) in physicalStates)
                 {
-                    if (!_graph.TryGetBay(bayId, out var bay))
+                    if (!runtime.Graph.TryGetBay(bayId, out var bay))
                         continue;
 
                     switch (eventType)
@@ -823,7 +822,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
                 foreach (var (lease, route, vehicleType, startNodeId) in precomputedRoutes)
                 {
-                    if (!_graph.TryGetBay(lease.BayId, out var bay))
+                    if (!runtime.Graph.TryGetBay(lease.BayId, out var bay))
                         continue;
 
                     var expiresAt = now.Add(lease.RemainingTtl is { } ttl && ttl > TimeSpan.Zero ? ttl : DefaultLeaseTtl);
@@ -842,7 +841,6 @@ public sealed class ParkingAllocationService : IParkingAllocationService
                         tenantId);
 
                     _sessions[new SessionKey(tenantId, lease.VehicleSessionId)] = session;
-                    _bayTenants[lease.BayId] = tenantId;
                     restoredSessions.Add(session);
                     restoredForTenant++;
                 }
@@ -850,7 +848,7 @@ public sealed class ParkingAllocationService : IParkingAllocationService
 
             foreach (var session in restoredSessions)
             {
-                _congestionTracker.AddRouteLoad(session.Route.Steps.Select(s => s.EdgeId));
+                runtime.Congestion.AddRouteLoad(session.Route.Steps.Select(s => s.EdgeId));
             }
 
             totalRestored += restoredForTenant;

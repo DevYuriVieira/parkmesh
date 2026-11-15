@@ -635,14 +635,22 @@ async function setActiveTenant(nextTenant) {
   }
 
   state.tenantId = nextTenant;
+  client.setTenantId(nextTenant);
   document.getElementById("auditTenantLabel").textContent = nextTenant;
   logEvent(`Active tenant switched -> ${nextTenant}`, "assigned");
 
-  const snapRes = await apiFetch("/api/parking/snapshot");
-  if (snapRes.ok) {
-    applySnapshot(await snapRes.json());
-  } else {
-    logEvent(`Tenant '${nextTenant}' rejected (${snapRes.status}).`, "occupied");
+  try {
+    const hubSnapshot = await client.invoke("SubscribeTenant", nextTenant);
+    if (hubSnapshot) {
+      applySnapshot(hubSnapshot);
+    }
+  } catch {
+    const snapRes = await apiFetch("/api/parking/snapshot");
+    if (snapRes.ok) {
+      applySnapshot(await snapRes.json());
+    } else {
+      logEvent(`Tenant '${nextTenant}' rejected (${snapRes.status}).`, "occupied");
+    }
   }
 
   if (auditDrawer.open) {
@@ -681,6 +689,7 @@ async function bootstrap() {
   }
 
   try {
+    client.setTenantId(state.tenantId);
     await client.connect();
     const snapshot = await client.invoke("GetParkingSnapshot");
     if (snapshot) applySnapshot(snapshot);

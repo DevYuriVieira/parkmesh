@@ -57,13 +57,13 @@ public static class LoadHarnessRunner
 
                 sharedClient = factory.CreateClient();
                 var wsClient = factory.Server.CreateWebSocketClient();
-                ws = await wsClient.ConnectAsync(new Uri("ws://localhost/hubs/parking"), wsCts.Token);
+                ws = await wsClient.ConnectAsync(new Uri("ws://localhost/hubs/parking?tenantId=tenant-load-1"), wsCts.Token);
             }
             else
             {
                 sharedClient = new HttpClient { BaseAddress = new Uri(baseUrl.TrimEnd('/') + "/") };
                 var clientWs = new ClientWebSocket();
-                var wsUri = new Uri(sharedClient.BaseAddress.ToString().Replace("http", "ws", StringComparison.OrdinalIgnoreCase) + "hubs/parking");
+                var wsUri = new Uri(sharedClient.BaseAddress.ToString().Replace("http", "ws", StringComparison.OrdinalIgnoreCase) + "hubs/parking?tenantId=tenant-load-1");
                 await clientWs.ConnectAsync(wsUri, wsCts.Token);
                 ws = clientWs;
             }

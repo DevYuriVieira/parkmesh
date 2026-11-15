@@ -17,6 +17,8 @@ public sealed class SecurityOptions
     public int ChaosWindowSeconds { get; set; } = 10;
     public int MaxRequestBodyBytes { get; set; } = 64 * 1024;
     public string[] AllowedTenants { get; set; } = [];
+    public bool EnableChaosEndpoints { get; set; } = false;
+    public bool AllowUnauthenticatedProduction { get; set; } = false;
 }
 
 public static class ApiKeyValidator
@@ -129,10 +131,24 @@ public sealed class TenantResolutionMiddleware
 
     public async Task InvokeAsync(HttpContext context)
     {
-        if (!context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase))
+        var isApiPath = context.Request.Path.StartsWithSegments("/api", StringComparison.OrdinalIgnoreCase);
+        var isHubPath = context.Request.Path.StartsWithSegments("/hubs", StringComparison.OrdinalIgnoreCase);
+
+        if (!isApiPath && !isHubPath)
         {
             await _next(context);
             return;
+        }
+
+        if (isHubPath)
+        {
+            var configuredKey = _options.CurrentValue.ApiKey;
+            if (!ApiKeyValidator.IsAuthorized(context.Request.Headers, configuredKey))
+            {
+                context.Response.StatusCode = StatusCodes.Status401Unauthorized;
+                await context.Response.WriteAsJsonAsync(new { error = "Unauthorized." });
+                return;
+            }
         }
 
         var tenantId = TenantDefaults.DefaultTenantId;
@@ -146,6 +162,17 @@ public sealed class TenantResolutionMiddleware
             }
 
             tenantId = values[0]!;
+        }
+        else if (isHubPath && context.Request.Query.TryGetValue("tenantId", out var queryValues))
+        {
+            if (queryValues.Count != 1 || !TenantIdValidator.IsValid(queryValues[0]))
+            {
+                context.Response.StatusCode = StatusCodes.Status400BadRequest;
+                await context.Response.WriteAsJsonAsync(new { error = "Invalid tenantId query parameter." });
+                return;
+            }
+
+            tenantId = queryValues[0]!;
         }
 
         var allowed = _options.CurrentValue.AllowedTenants;

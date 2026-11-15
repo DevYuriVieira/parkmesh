@@ -134,8 +134,6 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
         using (tenantContext.BeginScope("tenant-beta"))
         {
             Assert.False(await manager.TryReleaseLeaseAsync("F0-B05", 99));
-            Assert.True(await manager.TryReleaseLeaseAsync("F0-B05", leaseBeta.FencingToken));
-            Assert.Null(await manager.GetActiveLeaseHolderAsync("F0-B05"));
         }
 
         using (tenantContext.BeginScope("tenant-alpha"))
@@ -156,7 +154,7 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
             Assert.False(crossRelease);
         }
 
-        // 3. Multi-tenant rehydration restores active leases for distinct physical bays onto one garage service
+        // 3. Multi-tenant rehydration restores overlapping and distinct bay IDs independently per tenant garage
         LeaseAcquireResult leaseBetaOtherBay;
         using (tenantContext.BeginScope("tenant-beta"))
         {
@@ -174,10 +172,22 @@ public sealed class RedisBayLeaseManagerIntegrationTests : IAsyncLifetime
             tenantContext: tenantContext);
 
         var restored = await service.RehydrateStateAsync(["default", "tenant-alpha", "tenant-beta"]);
-        Assert.Equal(3, restored);
+        Assert.Equal(4, restored);
         Assert.Equal(2, service.GetActiveSessions("tenant-alpha").Count);
-        Assert.Single(service.GetActiveSessions("tenant-beta"));
+        Assert.Equal(2, service.GetActiveSessions("tenant-beta").Count);
         Assert.Empty(service.GetActiveSessions("default"));
+
+        using (tenantContext.BeginScope("tenant-alpha"))
+        {
+            Assert.Equal("SHARED-CAR", service.Graph.BaysById["F0-B05"].CurrentSessionId);
+            Assert.Equal("CAR-ALPHA-2", service.Graph.BaysById["F0-B06"].CurrentSessionId);
+        }
+
+        using (tenantContext.BeginScope("tenant-beta"))
+        {
+            Assert.Equal("OTHER-CAR", service.Graph.BaysById["F0-B05"].CurrentSessionId);
+            Assert.Equal("CAR-BETA", service.Graph.BaysById["F1-B08"].CurrentSessionId);
+        }
     }
 
     private RedisBayLeaseManager CreateManager(string prefix) =>

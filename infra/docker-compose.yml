@@ -1,3 +1,4 @@
+# Local development and demo stack only; credentials below are not for production deployment.
 services:
   redis:
     image: redis:7.4-alpine
@@ -52,6 +53,7 @@ services:
     ports:
       - "5150:8080"
     environment:
+      ASPNETCORE_ENVIRONMENT: "Development"
       ConnectionStrings__Redis: "redis:6379"
       ConnectionStrings__Postgres: "Host=postgres;Port=5432;Database=parkmesh;Username=parkmesh;Password=parkmesh_dev_password"
       Postgres__AppRole: "parkmesh_app"

@@ -3,12 +3,17 @@ const RECORD_SEPARATOR = "\u001e";
 export class SignalRLiteClient {
   constructor(hubPath) {
     this.hubPath = hubPath;
+    this.tenantId = "default";
     this.ws = null;
     this.handlers = new Map();
     this.pendingInvocations = new Map();
     this.nextInvocationId = 1;
     this.stateListeners = [];
     this.shouldReconnect = true;
+  }
+
+  setTenantId(tenantId) {
+    this.tenantId = tenantId || "default";
   }
 
   on(eventName, callback) {
@@ -31,7 +36,8 @@ export class SignalRLiteClient {
   async connect() {
     this.shouldReconnect = true;
     const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
-    const url = `${protocol}//${window.location.host}${this.hubPath}`;
+    const separator = this.hubPath.includes("?") ? "&" : "?";
+    const url = `${protocol}//${window.location.host}${this.hubPath}${separator}tenantId=${encodeURIComponent(this.tenantId)}`;
 
     return new Promise((resolve, reject) => {
       let handshakeCompleted = false;
