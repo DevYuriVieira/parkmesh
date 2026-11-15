@@ -125,4 +125,4 @@ Key technical trade-offs and operational policies are documented in `docs/`:
 6. [ADR 0006 — Asynchronous Audit Outbox, Proactive Lease Reconciliation, and Edge Hardening](adr/0006-async-audit-outbox-and-lease-reconciliation.md)
 7. [ADR 0007 — Single-Pass Indexed Multi-Target Routing, Startup State Hydration, and Bay Maintenance Lifecycle](adr/0007-indexed-multi-target-routing-and-state-hydration.md)
 8. [ADR 0008 — Tenant as Isolated Logical Garage](adr/0008-tenant-as-isolated-logical-garage.md)
-9. [Threat Model](THREAT_MODEL.md) · [Operational Runbook](RUNBOOK.md)
+9. [Threat Model](THREAT_MODEL.md) · [Operational Runbook](RUNBOOK.md) · [Capacity & SLO Baseline](CAPACITY.md)
