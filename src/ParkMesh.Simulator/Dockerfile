@@ -20,5 +20,6 @@ FROM mcr.microsoft.com/dotnet/runtime:10.0 AS runtime
 WORKDIR /app
 
 COPY --from=build /app/publish ./
+USER app
 
 ENTRYPOINT ["dotnet", "ParkMesh.Simulator.dll"]

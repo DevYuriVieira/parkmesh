@@ -192,7 +192,12 @@ public sealed class SecurityAndHardeningIntegrationTests : IClassFixture<WebAppl
             },
             () => new HttpRequestMessage(HttpMethod.Post, "/api/parking/chaos/intruder"),
             () => new HttpRequestMessage(HttpMethod.Post, "/api/parking/chaos/burst?count=1"),
-            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/audit")
+            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/audit"),
+            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/snapshot"),
+            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/bays"),
+            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/metrics"),
+            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/sessions"),
+            () => new HttpRequestMessage(HttpMethod.Get, "/api/parking/telemetry/metrics")
         };
 
         foreach (var factory in protectedRequests)

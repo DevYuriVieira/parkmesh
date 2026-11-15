@@ -108,4 +108,48 @@ public sealed class TelemetryPipelineTests
         Assert.Equal("CAR-LIVE-1", active.VehicleSessionId);
         Assert.NotEqual(leasedBay, active.AssignedBayId);
     }
+
+    [Fact]
+    public void SensorReadingFilter_KeepsIndependentStatePerTenant()
+    {
+        var filter = new SensorReadingFilter(new SensorDebounceOptions { MinConsecutiveReadings = 2, StabilityWindowMs = 0 });
+        var t0 = DateTimeOffset.UtcNow;
+
+        Assert.Equal(SensorFilterOutcome.Debouncing, filter.Evaluate(new BaySensorReading("F0-B01", true, 30, 1, t0, null, "tenant-a")));
+        // Same bay and same sequence number on another tenant must not be treated as stale.
+        Assert.Equal(SensorFilterOutcome.Debouncing, filter.Evaluate(new BaySensorReading("F0-B01", true, 30, 1, t0, null, "tenant-b")));
+        Assert.Equal(SensorFilterOutcome.ConfirmedTransition, filter.Evaluate(new BaySensorReading("F0-B01", true, 30, 2, t0.AddSeconds(1), null, "tenant-a")));
+    }
+
+    [Fact]
+    public async Task SensorTelemetryProcessor_ReconcilesOnlyTheReadingTenant()
+    {
+        var tenantContext = new AsyncLocalTenantContext();
+        var allocationService = new ParkingAllocationService(
+            StandardTopologyFactory.CreateStandardGarage(),
+            new AStarPathfinder(),
+            new InMemoryBayLeaseManager(tenantContext),
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance,
+            tenantContext: tenantContext);
+
+        var options = new SensorDebounceOptions { MinConsecutiveReadings = 1, StabilityWindowMs = 0 };
+        var processor = new SensorTelemetryProcessor(
+            new TelemetryIngestionChannel(options),
+            new SensorReadingFilter(options),
+            allocationService,
+            NullLogger<SensorTelemetryProcessor>.Instance,
+            tenantContext);
+
+        var outcome = await processor.ProcessSingleAsync(
+            new BaySensorReading("F0-B05", true, 40, 1, DateTimeOffset.UtcNow, "CAR-A", "tenant-a"));
+        Assert.Equal(SensorFilterOutcome.ConfirmedTransition, outcome);
+
+        using (tenantContext.BeginScope("tenant-a"))
+            Assert.Equal(BayStatus.Occupied, allocationService.Graph.BaysById["F0-B05"].Status);
+        using (tenantContext.BeginScope("tenant-b"))
+            Assert.Equal(BayStatus.Free, allocationService.Graph.BaysById["F0-B05"].Status);
+        using (tenantContext.BeginScope("default"))
+            Assert.Equal(BayStatus.Free, allocationService.Graph.BaysById["F0-B05"].Status);
+    }
 }

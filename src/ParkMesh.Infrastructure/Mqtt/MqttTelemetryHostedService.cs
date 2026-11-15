@@ -108,7 +108,7 @@ public sealed class MqttTelemetryHostedService : BackgroundService
             {
                 var reading = JsonSerializer.Deserialize<BaySensorReading>(payload, MqttConnectionManager.JsonOptions);
                 if (reading is not null)
-                    _sensorChannel.TryEnqueue(reading);
+                    _sensorChannel.TryEnqueue(reading with { TenantId = null }); // MQTT topics are single-tenant ("default").
             }
             else if (topic.StartsWith("parkmesh/gates/", StringComparison.OrdinalIgnoreCase))
             {

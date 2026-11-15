@@ -28,6 +28,9 @@ jobs:
       - name: Validate Docker Compose configuration
         run: docker compose -f infra/docker-compose.yml --profile full config --quiet
 
+      - name: Build container images (API, TelemetryWorker, Simulator)
+        run: docker compose -f infra/docker-compose.yml --profile full build
+
       - name: Run unit tests
         run: dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build --verbosity normal
 

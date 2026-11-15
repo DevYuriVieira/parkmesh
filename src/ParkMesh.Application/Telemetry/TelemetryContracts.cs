@@ -19,7 +19,8 @@ public sealed record BaySensorReading(
     double DistanceCm,
     long Seq,
     DateTimeOffset TimestampUtc,
-    string? VehicleSessionId = null);
+    string? VehicleSessionId = null,
+    string? TenantId = null);
 
 public sealed record VehicleAdmittedEvent(
     string EventId,

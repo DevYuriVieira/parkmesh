@@ -39,8 +39,9 @@ builder.Services.AddRateLimiter(options =>
         if (!security.EnableRateLimiting)
             return RateLimitPartition.GetNoLimiter("disabled");
 
+        var tenantPartition = httpContext.RequestServices.GetRequiredService<ITenantContext>().CurrentTenantId;
         return RateLimitPartition.GetFixedWindowLimiter(
-            partitionKey: "chaos-global",
+            partitionKey: tenantPartition,
             factory: _ => new FixedWindowRateLimiterOptions
             {
                 PermitLimit = Math.Max(1, security.ChaosPermitLimit),
@@ -102,6 +103,22 @@ builder.Services
     });
 
 var app = builder.Build();
+
+var startupSecurity = app.Services.GetRequiredService<IOptions<SecurityOptions>>().Value;
+if (!app.Environment.IsDevelopment() &&
+    string.IsNullOrWhiteSpace(startupSecurity.ApiKey) &&
+    !startupSecurity.AllowUnauthenticatedProduction)
+{
+    throw new InvalidOperationException(
+        "Security:ApiKey must be configured outside Development unless Security:AllowUnauthenticatedProduction=true.");
+}
+
+if (!app.Environment.IsDevelopment() && startupSecurity.AllowedTenants is not { Length: > 0 })
+{
+    // Each tenant allocates an in-memory garage; an open tenant set is an unbounded memory sink.
+    throw new InvalidOperationException(
+        "Security:AllowedTenants must list at least one tenant outside Development.");
+}
 
 app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseExceptionHandler(errorApp =>
@@ -192,16 +209,18 @@ app.MapGet("/api/parking/snapshot", (
     ITelemetryIngestionChannel telemetryChannel,
     SignalRParkingEventSink eventSink,
     ITenantContext tenantContext) =>
-    Results.Ok(SnapshotBuilder.Build(allocationService, metrics, telemetryChannel, eventSink, tenantContext.CurrentTenantId)));
+    Results.Ok(SnapshotBuilder.Build(allocationService, metrics, telemetryChannel, eventSink, tenantContext.CurrentTenantId)))
+    .AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/metrics", (
     IParkingAllocationService allocationService,
     IEngineMetricsRecorder metrics,
-    ITelemetryIngestionChannel telemetryChannel) =>
+    ITelemetryIngestionChannel telemetryChannel,
+    ITenantContext tenantContext) =>
 {
-    var sessions = allocationService.GetActiveSessions();
+    var sessions = allocationService.GetActiveSessions(tenantContext.CurrentTenantId);
     return Results.Ok(metrics.BuildSnapshot(allocationService.Graph, sessions.Count, telemetryChannel.GetMetrics()));
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/audit", async (
     [FromQuery] int? limit,
@@ -253,7 +272,7 @@ app.MapGet("/api/parking/bays", (
         });
 
     return Results.Ok(result);
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapPost("/api/parking/allocations", async (
     AllocateSpotApiRequest request,
@@ -338,7 +357,8 @@ app.MapPatch("/api/parking/bays/{bayId}/maintenance", async (
 app.MapGet("/api/parking/sessions", (
     IParkingAllocationService allocationService,
     ITenantContext tenantContext) =>
-    Results.Ok(allocationService.GetActiveSessions(tenantContext.CurrentTenantId)));
+    Results.Ok(allocationService.GetActiveSessions(tenantContext.CurrentTenantId)))
+    .AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapPost("/api/parking/sessions/{sessionId}/progress", async (
     string sessionId,
@@ -351,65 +371,71 @@ app.MapPost("/api/parking/sessions/{sessionId}/progress", async (
 }).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/telemetry/metrics", (ITelemetryIngestionChannel channel) =>
-    Results.Ok(channel.GetMetrics()));
+    Results.Ok(channel.GetMetrics()))
+    .AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapPost("/api/parking/telemetry/readings", (
     BaySensorReading reading,
+    ITenantContext tenantContext,
     ITelemetryIngestionChannel channel) =>
 {
-    var enqueued = channel.TryEnqueue(reading);
+    // Tenant comes from the validated X-Tenant-Id header, never from the payload.
+    var enqueued = channel.TryEnqueue(reading with { TenantId = tenantContext.CurrentTenantId });
     return enqueued ? Results.Accepted() : Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
 }).AddEndpointFilter<ApiKeyEndpointFilter>();
 
-var chaosIntruderEndpoint = app.MapPost("/api/parking/chaos/intruder", async (
-    IParkingAllocationService allocationService,
-    ITenantContext tenantContext,
-    CancellationToken ct) =>
+if (app.Environment.IsDevelopment() || startupSecurity.EnableChaosEndpoints)
 {
-    var targetSession = allocationService.GetActiveSessions(tenantContext.CurrentTenantId).FirstOrDefault();
-    if (targetSession is null)
-        return Results.Conflict(new { error = "No active leased bay available for intrusion in the current tenant." });
-
-    var result = await allocationService.ReconcilePhysicalOccupancyAsync(
-        targetSession.AssignedBayId,
-        occupied: true,
-        occupantSessionId: $"INTRUDER-{Random.Shared.Next(100, 999)}",
-        ct);
-
-    return Results.Ok(result);
-});
-
-var chaosBurstEndpoint = app.MapPost("/api/parking/chaos/burst", async (
-    [FromQuery] int? count,
-    IParkingAllocationService allocationService,
-    CancellationToken ct) =>
-{
-    var batchSize = Math.Clamp(count ?? 25, 1, 60);
-    var vehicleTypes = Enum.GetValues<VehicleType>();
-    var gates = allocationService.Graph.Gates.Select(g => g.Id).ToArray();
-
-    var tasks = Enumerable.Range(0, batchSize).Select(i =>
+    var chaosIntruderEndpoint = app.MapPost("/api/parking/chaos/intruder", async (
+        IParkingAllocationService allocationService,
+        ITenantContext tenantContext,
+        CancellationToken ct) =>
     {
-        var gate = gates[i % gates.Length];
-        var type = vehicleTypes[i % vehicleTypes.Length];
-        var sessionId = $"BURST-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{i:D2}";
-        return allocationService.AllocateAsync(new AllocateSpotRequest(gate, sessionId, type), ct);
+        var targetSession = allocationService.GetActiveSessions(tenantContext.CurrentTenantId).FirstOrDefault();
+        if (targetSession is null)
+            return Results.Conflict(new { error = "No active leased bay available for intrusion in the current tenant." });
+
+        var result = await allocationService.ReconcilePhysicalOccupancyAsync(
+            targetSession.AssignedBayId,
+            occupied: true,
+            occupantSessionId: $"INTRUDER-{Random.Shared.Next(100, 999)}",
+            ct);
+
+        return Results.Ok(result);
     });
 
-    var results = await Task.WhenAll(tasks);
-    var succeeded = results.Count(r => r.Succeeded);
-
-    return Results.Ok(new
+    var chaosBurstEndpoint = app.MapPost("/api/parking/chaos/burst", async (
+        [FromQuery] int? count,
+        IParkingAllocationService allocationService,
+        CancellationToken ct) =>
     {
-        requested = batchSize,
-        succeeded,
-        failed = batchSize - succeeded,
-        sessions = results.Where(r => r.Succeeded && r.Session is not null).Select(r => r.Session)
-    });
-});
+        var batchSize = Math.Clamp(count ?? 25, 1, 60);
+        var vehicleTypes = Enum.GetValues<VehicleType>();
+        var gates = allocationService.Graph.Gates.Select(g => g.Id).ToArray();
 
-chaosIntruderEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
-chaosBurstEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
+        var tasks = Enumerable.Range(0, batchSize).Select(i =>
+        {
+            var gate = gates[i % gates.Length];
+            var type = vehicleTypes[i % vehicleTypes.Length];
+            var sessionId = $"BURST-{DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()}-{i:D2}";
+            return allocationService.AllocateAsync(new AllocateSpotRequest(gate, sessionId, type), ct);
+        });
+
+        var results = await Task.WhenAll(tasks);
+        var succeeded = results.Count(r => r.Succeeded);
+
+        return Results.Ok(new
+        {
+            requested = batchSize,
+            succeeded,
+            failed = batchSize - succeeded,
+            sessions = results.Where(r => r.Succeeded && r.Session is not null).Select(r => r.Session)
+        });
+    });
+
+    chaosIntruderEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
+    chaosBurstEndpoint.RequireRateLimiting("chaos").AddEndpointFilter<ApiKeyEndpointFilter>();
+}
 
 app.MapHub<ParkingHub>("/hubs/parking");
 
