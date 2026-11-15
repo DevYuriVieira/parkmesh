@@ -113,9 +113,9 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 
 ---
 
-## 5. Architecture Decision Records
+## 5. Architecture Decision Records & Operational Docs
 
-Key technical trade-offs are documented in `docs/adr/`:
+Key technical trade-offs and operational policies are documented in `docs/`:
 
 1. [ADR 0001 — Modular Monolith with Dedicated Edge Workers](adr/0001-modular-monolith-over-microservices.md)
 2. [ADR 0002 — Atomic Redis Lua Leases with Monotonic Fencing Tokens](adr/0002-redis-lua-leases-with-fencing-tokens.md)
@@ -124,3 +124,4 @@ Key technical trade-offs are documented in `docs/adr/`:
 5. [ADR 0005 — SignalR Delta Protocol and Zero-Build HTML5 Canvas Simulator](adr/0005-signalr-delta-protocol-and-zero-build-canvas.md)
 6. [ADR 0006 — Asynchronous Audit Outbox, Proactive Lease Reconciliation, and Edge Hardening](adr/0006-async-audit-outbox-and-lease-reconciliation.md)
 7. [ADR 0007 — Single-Pass Indexed Multi-Target Routing, Startup State Hydration, and Bay Maintenance Lifecycle](adr/0007-indexed-multi-target-routing-and-state-hydration.md)
+8. [ADR 0008 — Tenant as Isolated Logical Garage](adr/0008-tenant-as-isolated-logical-garage.md)
