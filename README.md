@@ -844,7 +844,7 @@ Medição de heap gerenciado estabilizado (`GC.GetTotalMemory(true)`) após mate
 ## 24. Auditoria Técnica e Quality Gate
 
 - **Compilação & Análise Estática:** `dotnet build ParkMesh.sln -c Release --no-restore` concluiu com **0 avisos e 0 erros** (`TreatWarningsAsErrors=true`, `Nullable=enable`).
-- **Pipeline Verde na `main` (`ParkMesh CI`):** Job `build-test-bench` concluído com sucesso no GitHub Actions (`ubuntu-latest`), incluindo validação do Docker Compose, build das 3 imagens não-root, smoke test do container `parkmesh-api` (`UID != 0` + `/health/ready` `200 OK`), 65 testes unitários, 34 testes integrados completos com Testcontainers Redis e PostgreSQL 17 RLS, resumo Cobertura e Load SLO Gate.
+- **Pipeline Verde na `main` (`ParkMesh CI`):** Job `build-and-test` concluído com sucesso no GitHub Actions (`ubuntu-latest`), incluindo validação do Docker Compose, build das 3 imagens não-root, smoke test do container `parkmesh-api` (`UID != 0` + `/health/ready` `200 OK`), 65 testes unitários, 34 testes integrados completos com Testcontainers Redis e PostgreSQL 17 RLS, resumo Cobertura e Load SLO Gate.
 - **Escopo de Execução Declarado:** No ambiente Windows sem Docker Desktop ativo, os `65` testes unitários, os `26` testes de integração sem Docker, o `--load --slo` e o `--capacity` foram validados localmente; os `8` testes Testcontainers (Redis + Postgres RLS) e o smoke test do container em execução foram validados no runner Linux do CI.
 
 ---
@@ -1677,7 +1677,7 @@ Stabilized managed heap (`GC.GetTotalMemory(true)`) after provisioning `N` warme
 ## 24. Technical Audit & Quality Gate
 
 - **Zero-Warning Build:** `dotnet build ParkMesh.sln -c Release --no-restore` passes with **0 warnings and 0 errors** (`TreatWarningsAsErrors=true`, `Nullable=enable`).
-- **Passing `main` CI Pipeline (`ParkMesh CI`):** The `build-test-bench` job succeeded on `ubuntu-latest`, verifying Compose validity, multi-stage image builds, non-root `USER app` container startup (`UID != 0` + `/health/ready` `200 OK`), 65 unit tests, 34 full integration tests including Testcontainers Redis and PostgreSQL 17 RLS, Cobertura coverage reporting, and the Load SLO Gate.
+- **Passing `main` CI Pipeline (`ParkMesh CI`):** The `build-and-test` job succeeded on `ubuntu-latest`, verifying Compose validity, multi-stage image builds, non-root `USER app` container startup (`UID != 0` + `/health/ready` `200 OK`), 65 unit tests, 34 full integration tests including Testcontainers Redis and PostgreSQL 17 RLS, Cobertura coverage reporting, and the Load SLO Gate.
 - **Honest Execution Scope Disclosure:** On Windows without a local Docker Desktop daemon running, all `65` unit tests, `26` non-Docker integration tests, `--load --slo`, and `--capacity` ran locally on `main`, while the `8` Testcontainers integration suites and the live `USER app` container smoke test executed and passed on the Linux CI runner.
 
 ---
