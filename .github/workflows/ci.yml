@@ -122,3 +122,6 @@ jobs:
           if summary_path:
               with open(summary_path, "a", encoding="utf-8") as fh:
                   fh.write(summary)
+
+      - name: Run load benchmark SLO gate
+        run: dotnet run --project benchmarks/ParkMesh.Benchmarks/ParkMesh.Benchmarks.csproj -c Release --no-build -- --load --concurrency 16 --requests 300 --slo benchmarks/ParkMesh.Benchmarks/slo-baseline.json
