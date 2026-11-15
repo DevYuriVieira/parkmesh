@@ -1,3 +1,4 @@
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Routing;
 using ParkMesh.Domain;
 
@@ -48,5 +49,45 @@ public sealed class TopologyTests
         var graph = StandardTopologyFactory.CreateStandardGarage();
         var supportedCount = graph.BaysById.Values.Count(b => b.SupportsVehicle(vehicleType));
         Assert.Equal(expectedCount, supportedCount);
+    }
+
+    [Fact]
+    public void ParkingGraph_RejectsEdgesWithUnknownNodes_AndClonesIndependentBayStatuses()
+    {
+        var node = new GraphNode("N-1", 0, 0, 0, NodeType.Intersection);
+
+        Assert.Throws<InvalidOperationException>(() =>
+            new ParkingGraph([node], [new GraphEdge("E-BAD-SRC", "MISSING-SRC", "N-1", 10)], []));
+        Assert.Throws<InvalidOperationException>(() =>
+            new ParkingGraph([node], [new GraphEdge("E-BAD-DST", "N-1", "MISSING-DST", 10)], []));
+
+        var original = StandardTopologyFactory.CreateStandardGarage();
+        var cloned = original.CloneTopology();
+
+        Assert.Empty(original.GetOutgoingEdges("NO-SUCH-NODE"));
+
+        cloned.BaysById["F0-B01"].MarkOccupied("CLONE-SESSION");
+        Assert.Equal(BayStatus.Occupied, cloned.BaysById["F0-B01"].Status);
+        Assert.Equal(BayStatus.Free, original.BaysById["F0-B01"].Status);
+    }
+
+    [Fact]
+    public void InMemoryEdgeCongestionTracker_AccumulatesAndClampsPenaltiesAtZero()
+    {
+        var tracker = new InMemoryEdgeCongestionTracker();
+
+        Assert.Equal(0.0, tracker.GetPenalty("UNKNOWN-EDGE"));
+
+        tracker.AddRouteLoad(["E-NORTH-1", "E-NORTH-2"], weightPerVehicle: 6.0);
+        tracker.AddRouteLoad(["e-north-1"], weightPerVehicle: 4.0);
+
+        Assert.Equal(10.0, tracker.GetPenalty("E-NORTH-1"));
+        Assert.Equal(6.0, tracker.GetPenalty("E-NORTH-2"));
+
+        tracker.RemoveRouteLoad(["E-NORTH-1", "E-NORTH-2"], weightPerVehicle: 15.0);
+
+        Assert.Equal(0.0, tracker.GetPenalty("E-NORTH-1"));
+        Assert.Equal(0.0, tracker.GetPenalty("E-NORTH-2"));
+        Assert.All(tracker.Snapshot().Values, v => Assert.Equal(0.0, v));
     }
 }

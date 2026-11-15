@@ -172,4 +172,27 @@ public sealed class SecurityAndRlsTests
         Assert.Throws<ArgumentException>(() => new PostgresParkingAuditStore("Host=localhost;Database=test", "bad_role; DROP TABLE x;--"));
         Assert.Throws<ArgumentException>(() => new PostgresParkingAuditStore("Host=localhost;Database=test", "1invalid"));
     }
+
+    [Fact]
+    public async Task InMemoryAuditStore_ClampsQueryLimitsAndResolvesLatestChronologicalPhysicalState()
+    {
+        var store = new InMemoryParkingAuditStore();
+        await store.InitializeAsync();
+        var t0 = DateTimeOffset.UtcNow;
+
+        await store.RecordBatchAsync(
+        [
+            new ParkingAuditEvent(t0, AuditEventType.BayAllocated, "F0-B09", "S-1", 1, VehicleType.Standard, "GATE-N1", null, TenantId: "tenant-alpha"),
+            new ParkingAuditEvent(t0.AddSeconds(1), AuditEventType.PhysicalOccupied, "F0-B09", "S-1", null, null, null, null, TenantId: "tenant-alpha"),
+            new ParkingAuditEvent(t0.AddSeconds(2), AuditEventType.PhysicalVacated, "F0-B09", "S-1", null, null, null, null, TenantId: "tenant-alpha"),
+            new ParkingAuditEvent(t0.AddSeconds(3), AuditEventType.BayOutOfService, "F0-B09", null, null, null, null, "maint", TenantId: "tenant-alpha"),
+            new ParkingAuditEvent(t0.AddSeconds(4), AuditEventType.BayRestored, "F0-B09", null, null, null, null, "cleared", TenantId: "tenant-alpha")
+        ]);
+
+        var latest = await store.GetLatestBayPhysicalStatesAsync("tenant-alpha");
+        Assert.Equal(AuditEventType.BayRestored, latest["F0-B09"]);
+
+        Assert.Equal(2, (await store.GetRecentAsync("tenant-alpha", limit: 2)).Count);
+        Assert.Single(await store.GetRecentAsync("tenant-alpha", limit: 0));
+    }
 }

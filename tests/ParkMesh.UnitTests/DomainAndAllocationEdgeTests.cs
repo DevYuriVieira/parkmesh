@@ -465,4 +465,72 @@ public sealed class DomainAndAllocationEdgeTests
         public Task<bool> PingAsync(CancellationToken ct = default) =>
             Task.FromResult(false);
     }
+
+    [Fact]
+    public async Task InMemoryBayLeaseManager_ExpiresStaleEntriesAndPreservesMonotonicFenceAcrossReacquisition()
+    {
+        var clock = new MutableTimeProvider(new DateTimeOffset(2026, 11, 15, 12, 0, 0, TimeSpan.Zero));
+        var leaseManager = new InMemoryBayLeaseManager(timeProvider: clock);
+
+        var lease1 = await leaseManager.TryAcquireLeaseAsync("F0-B10", "S-1", TimeSpan.FromSeconds(10));
+        Assert.True(lease1.Acquired);
+        Assert.Equal(1, lease1.FencingToken);
+        Assert.Equal("S-1", await leaseManager.GetActiveLeaseHolderAsync("F0-B10"));
+
+        var activeBefore = await leaseManager.GetActiveLeasesAsync(["F0-B10", "F0-B11"]);
+        var snapshot = Assert.Single(activeBefore);
+        Assert.Equal("F0-B10", snapshot.BayId);
+        Assert.Equal(TimeSpan.FromSeconds(10), snapshot.RemainingTtl);
+
+        clock.Advance(TimeSpan.FromSeconds(11));
+
+        Assert.Null(await leaseManager.GetActiveLeaseHolderAsync("F0-B10"));
+        Assert.Empty(await leaseManager.GetActiveLeasesAsync(["F0-B10"]));
+        Assert.False(await leaseManager.TryReleaseLeaseAsync("F0-B10", 1));
+
+        var lease2 = await leaseManager.TryAcquireLeaseAsync("F0-B10", "S-2", TimeSpan.FromSeconds(30));
+        Assert.True(lease2.Acquired);
+        Assert.Equal(2, lease2.FencingToken);
+    }
+
+    [Fact]
+    public async Task ReconcilePhysicalOccupancyAsync_WhenPlannedSessionParksAndDeparts_CompletesSessionLifecycleAndFreesBay()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var congestion = new InMemoryEdgeCongestionTracker();
+        var auditSink = new AuditChannelSink();
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            new InMemoryBayLeaseManager(),
+            congestion,
+            NullLogger<ParkingAllocationService>.Instance,
+            auditSink: auditSink);
+
+        var alloc = await service.AllocateAsync(
+            new AllocateSpotRequest("GATE-N1", "CAR-ARRIVE-1", VehicleType.Standard));
+        Assert.True(alloc.Succeeded);
+        var bayId = alloc.Session!.AssignedBayId;
+        Assert.Single(service.GetActiveSessions());
+        Assert.Contains(congestion.Snapshot().Values, v => v > 0);
+
+        var parked = await service.ReconcilePhysicalOccupancyAsync(bayId, occupied: true, occupantSessionId: "CAR-ARRIVE-1");
+        Assert.False(parked.WasIntruder);
+        Assert.Equal(BayStatus.Occupied, parked.NewStatus);
+        Assert.Empty(service.GetActiveSessions());
+        Assert.All(congestion.Snapshot().Values, v => Assert.Equal(0.0, v));
+
+        var vacated = await service.ReconcilePhysicalOccupancyAsync(bayId, occupied: false);
+        Assert.False(vacated.WasIntruder);
+        Assert.Equal(BayStatus.Free, vacated.NewStatus);
+        Assert.Equal(BayStatus.Free, graph.BaysById[bayId].Status);
+
+        var drained = new List<ParkingAuditEvent>();
+        while (auditSink.TryRead(out var ev))
+            drained.Add(ev);
+
+        Assert.Contains(drained, e => e.EventType == AuditEventType.BayAllocated && e.BayId == bayId);
+        Assert.Contains(drained, e => e.EventType == AuditEventType.PhysicalOccupied && e.BayId == bayId);
+        Assert.Contains(drained, e => e.EventType == AuditEventType.PhysicalVacated && e.BayId == bayId);
+    }
 }

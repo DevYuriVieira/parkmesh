@@ -80,4 +80,32 @@ public sealed class EngineMetricsTests
         Assert.Equal(1, snapshot.RedisLeaseLatency.SampleCount);
         Assert.Equal(telemetry, snapshot.Telemetry);
     }
+
+    [Fact]
+    public void SlidingLatencyWindow_SingleSample_AndRecorder_CountsOutOfServiceAndExpiredLeases()
+    {
+        var window = new SlidingLatencyWindow(32);
+        window.Add(12.345);
+        var p = window.ComputePercentiles();
+
+        Assert.Equal(1, p.SampleCount);
+        Assert.Equal(12.345, p.P50Ms);
+        Assert.Equal(12.345, p.P95Ms);
+        Assert.Equal(12.345, p.P99Ms);
+
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        graph.BaysById["F0-B01"].MarkOutOfService();
+        graph.BaysById["F0-B02"].MarkOutOfService();
+
+        using var recorder = new EngineMetricsRecorder();
+        recorder.RecordLeaseExpired();
+        recorder.RecordLeaseExpired();
+        recorder.RecordLeaseExpired();
+
+        var snapshot = recorder.BuildSnapshot(graph, activeSessions: 0, new TelemetryMetricsSnapshot(0, 0, 0, 0, 0));
+
+        Assert.Equal(2, snapshot.OutOfServiceBays);
+        Assert.Equal(118, snapshot.FreeBays);
+        Assert.Equal(3, snapshot.LeasesExpiredTotal);
+    }
 }
