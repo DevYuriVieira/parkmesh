@@ -6,10 +6,15 @@ using System.Text.Json;
 using System.Text.Json.Serialization;
 using Microsoft.AspNetCore.Mvc.Testing;
 using Microsoft.Extensions.Configuration;
+using Microsoft.Extensions.DependencyInjection;
+using Microsoft.Extensions.DependencyInjection.Extensions;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Application.Audit;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
+using ParkMesh.Infrastructure.Audit;
+using ParkMesh.Infrastructure.Redis;
 
 namespace ParkMesh.IntegrationTests;
 
@@ -402,6 +407,70 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
         Assert.True(paths.TryGetProperty("/api/parking/audit", out _));
     }
 
+    [Fact]
+    public async Task HealthReady_Returns503Degraded_WhenLeaseStoreOrAuditStoreFailsConnectivity()
+    {
+        using (var leaseDownFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IBayLeaseManager>();
+                services.AddSingleton<IBayLeaseManager>(sp =>
+                    new UnhealthyLeaseManager(new InMemoryBayLeaseManager(sp.GetService<ITenantContext>())));
+            });
+        }))
+        {
+            using var leaseClient = leaseDownFactory.CreateClient();
+            Assert.Equal(HttpStatusCode.OK, (await leaseClient.GetAsync("/health/live")).StatusCode);
+
+            var readyResponse = await leaseClient.GetAsync("/health/ready");
+            Assert.Equal(HttpStatusCode.ServiceUnavailable, readyResponse.StatusCode);
+
+            using var doc = await readyResponse.Content.ReadFromJsonAsync<JsonDocument>();
+            Assert.NotNull(doc);
+            Assert.Equal("degraded", doc!.RootElement.GetProperty("status").GetString());
+            Assert.Equal("unhealthy", doc.RootElement.GetProperty("dependencies").GetProperty("leaseStore").GetString());
+        }
+
+        using (var auditDownFactory = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.ConfigureServices(services =>
+            {
+                services.RemoveAll<IParkingAuditStore>();
+                services.AddSingleton<IParkingAuditStore>(new UnhealthyAuditStore());
+            });
+        }))
+        {
+            using var auditClient = auditDownFactory.CreateClient();
+            Assert.Equal(HttpStatusCode.OK, (await auditClient.GetAsync("/health/live")).StatusCode);
+
+            HttpResponseMessage? readyResponse = null;
+            JsonDocument? doc = null;
+            var deadline = DateTime.UtcNow.AddSeconds(3);
+            while (DateTime.UtcNow < deadline)
+            {
+                readyResponse?.Dispose();
+                readyResponse = await auditClient.GetAsync("/health/ready");
+                doc?.Dispose();
+                doc = await readyResponse.Content.ReadFromJsonAsync<JsonDocument>();
+                if (doc is not null && doc.RootElement.GetProperty("hydrated").GetBoolean())
+                    break;
+
+                await Task.Delay(25);
+            }
+
+            using (readyResponse)
+            using (doc)
+            {
+                Assert.NotNull(readyResponse);
+                Assert.Equal(HttpStatusCode.ServiceUnavailable, readyResponse!.StatusCode);
+                Assert.NotNull(doc);
+                Assert.Equal("degraded", doc!.RootElement.GetProperty("status").GetString());
+                Assert.Equal("unhealthy", doc.RootElement.GetProperty("dependencies").GetProperty("auditStore").GetString());
+            }
+        }
+    }
+
     private static bool IsHubTarget(JsonDocument doc, string targetName) =>
         doc.RootElement.TryGetProperty("type", out var t)
         && t.GetInt32() == 1
@@ -466,4 +535,63 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
     private sealed record AllocationEnvelope(ActiveVehicleSession Session, double ComputationTimeMs);
     private sealed record BurstEnvelope(int Requested, int Succeeded, int Failed, List<ActiveVehicleSession> Sessions);
     private sealed record AuditResponse(int Count, long DroppedCount, List<ParkingAuditEvent> Events);
+
+    private sealed class UnhealthyLeaseManager(InMemoryBayLeaseManager inner) : IBayLeaseManager
+    {
+        public Task<LeaseAcquireResult> TryAcquireLeaseAsync(
+            string bayId,
+            string vehicleSessionId,
+            TimeSpan ttl,
+            CancellationToken ct = default) =>
+            inner.TryAcquireLeaseAsync(bayId, vehicleSessionId, ttl, ct);
+
+        public Task<bool> TryReleaseLeaseAsync(string bayId, long fencingToken, CancellationToken ct = default) =>
+            inner.TryReleaseLeaseAsync(bayId, fencingToken, ct);
+
+        public Task<bool> InvalidateLeaseAsync(string bayId, CancellationToken ct = default) =>
+            inner.InvalidateLeaseAsync(bayId, ct);
+
+        public Task<string?> GetActiveLeaseHolderAsync(string bayId, CancellationToken ct = default) =>
+            inner.GetActiveLeaseHolderAsync(bayId, ct);
+
+        public Task<IReadOnlyList<ActiveLeaseSnapshot>> GetActiveLeasesAsync(
+            IReadOnlyCollection<string> bayIds,
+            CancellationToken ct = default) =>
+            inner.GetActiveLeasesAsync(bayIds, ct);
+
+        public Task<bool> PingAsync(CancellationToken ct = default) =>
+            Task.FromResult(false);
+    }
+
+    private sealed class UnhealthyAuditStore : IParkingAuditStore
+    {
+        private readonly InMemoryParkingAuditStore _inner = new();
+
+        public Task InitializeAsync(CancellationToken ct = default) =>
+            _inner.InitializeAsync(ct);
+
+        public Task RecordBatchAsync(IReadOnlyList<ParkingAuditEvent> events, CancellationToken ct = default) =>
+            _inner.RecordBatchAsync(events, ct);
+
+        public Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(int limit = 50, CancellationToken ct = default) =>
+            _inner.GetRecentAsync(limit, ct);
+
+        public Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(
+            string tenantId,
+            int limit = 50,
+            CancellationToken ct = default) =>
+            _inner.GetRecentAsync(tenantId, limit, ct);
+
+        public Task<IReadOnlyDictionary<string, AuditEventType>> GetLatestBayPhysicalStatesAsync(
+            CancellationToken ct = default) =>
+            _inner.GetLatestBayPhysicalStatesAsync(ct);
+
+        public Task<IReadOnlyDictionary<string, AuditEventType>> GetLatestBayPhysicalStatesAsync(
+            string tenantId,
+            CancellationToken ct = default) =>
+            _inner.GetLatestBayPhysicalStatesAsync(tenantId, ct);
+
+        public Task<bool> CheckConnectivityAsync(CancellationToken ct = default) =>
+            Task.FromResult(false);
+    }
 }

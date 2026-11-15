@@ -1,9 +1,11 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Application.Routing;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
+using ParkMesh.Infrastructure.Mqtt;
 using ParkMesh.Infrastructure.Redis;
 
 namespace ParkMesh.UnitTests;
@@ -183,5 +185,19 @@ public sealed class TelemetryPipelineTests
 
         using (tenantContext.BeginScope("default"))
             Assert.Equal(BayStatus.Occupied, allocationService.Graph.BaysById["F0-B07"].Status);
+    }
+
+    [Fact]
+    public async Task MqttConnectionManager_EnsureConnectedAsync_ReturnsFalseWhenBrokerUnreachable()
+    {
+        await using var manager = new MqttConnectionManager(
+            Options.Create(new MqttOptions { Enabled = true, Host = "127.0.0.1", Port = 1 }),
+            NullLogger<MqttConnectionManager>.Instance);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var connected = await manager.EnsureConnectedAsync(cts.Token);
+
+        Assert.False(connected);
+        Assert.False(manager.IsConnected);
     }
 }

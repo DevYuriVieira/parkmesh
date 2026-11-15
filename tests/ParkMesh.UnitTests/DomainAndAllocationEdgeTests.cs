@@ -425,4 +425,44 @@ public sealed class DomainAndAllocationEdgeTests
         public Task<bool> PingAsync(CancellationToken ct = default) =>
             Task.FromResult(true);
     }
+
+    [Fact]
+    public async Task AllocateAsync_WhenLeaseStoreThrowsOutageException_DoesNotLeavePhantomLocalLeaseOrSession()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+        var service = new ParkingAllocationService(
+            graph,
+            new AStarPathfinder(),
+            new ThrowingLeaseManager(),
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance);
+
+        await Assert.ThrowsAsync<InvalidOperationException>(() =>
+            service.AllocateAsync(new AllocateSpotRequest("GATE-N1", "REDIS-DOWN-CAR", VehicleType.Standard)));
+
+        Assert.Empty(service.GetActiveSessions());
+        Assert.All(graph.BaysById.Values, bay => Assert.Equal(BayStatus.Free, bay.Status));
+    }
+
+    private sealed class ThrowingLeaseManager : IBayLeaseManager
+    {
+        public Task<LeaseAcquireResult> TryAcquireLeaseAsync(
+            string bayId,
+            string vehicleSessionId,
+            TimeSpan ttl,
+            CancellationToken ct = default) =>
+            throw new InvalidOperationException("Simulated Redis outage");
+
+        public Task<bool> TryReleaseLeaseAsync(string bayId, long fencingToken, CancellationToken ct = default) =>
+            throw new InvalidOperationException("Simulated Redis outage");
+
+        public Task<bool> InvalidateLeaseAsync(string bayId, CancellationToken ct = default) =>
+            throw new InvalidOperationException("Simulated Redis outage");
+
+        public Task<string?> GetActiveLeaseHolderAsync(string bayId, CancellationToken ct = default) =>
+            throw new InvalidOperationException("Simulated Redis outage");
+
+        public Task<bool> PingAsync(CancellationToken ct = default) =>
+            Task.FromResult(false);
+    }
 }
