@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using ParkMesh.Application.Abstractions;
 
 namespace ParkMesh.Application.Telemetry;
 
@@ -43,7 +44,10 @@ public sealed class SensorReadingFilter : ISensorReadingFilter
         ArgumentNullException.ThrowIfNull(reading);
         ArgumentException.ThrowIfNullOrWhiteSpace(reading.BayId);
 
-        var key = (reading.TenantId ?? "default", reading.BayId.ToUpperInvariant());
+        var tenantId = string.IsNullOrWhiteSpace(reading.TenantId)
+            ? TenantDefaults.DefaultTenantId
+            : reading.TenantId;
+        var key = (tenantId, reading.BayId.ToUpperInvariant());
         var state = _states.GetOrAdd(key, static _ => new BayState());
 
         lock (state.Sync)

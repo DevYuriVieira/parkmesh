@@ -113,11 +113,13 @@ if (!app.Environment.IsDevelopment() &&
         "Security:ApiKey must be configured outside Development unless Security:AllowUnauthenticatedProduction=true.");
 }
 
-if (!app.Environment.IsDevelopment() && startupSecurity.AllowedTenants is not { Length: > 0 })
+if (!app.Environment.IsDevelopment() &&
+    (startupSecurity.AllowedTenants is not { Length: > 0 } ||
+     !startupSecurity.AllowedTenants.All(TenantIdValidator.IsValid)))
 {
-    // Each tenant allocates an in-memory garage; an open tenant set is an unbounded memory sink.
+    // Each tenant allocates an in-memory garage; an open or malformed allowlist is rejected at startup.
     throw new InvalidOperationException(
-        "Security:AllowedTenants must list at least one tenant outside Development.");
+        "Security:AllowedTenants must list valid tenant identifiers outside Development.");
 }
 
 app.UseMiddleware<SecurityHeadersMiddleware>();
@@ -201,7 +203,7 @@ app.MapGet("/api/parking/topology", (IParkingAllocationService allocationService
         nodes = graph.Nodes.Values,
         edges = graph.Edges
     });
-});
+}).AddEndpointFilter<ApiKeyEndpointFilter>();
 
 app.MapGet("/api/parking/snapshot", (
     IParkingAllocationService allocationService,
