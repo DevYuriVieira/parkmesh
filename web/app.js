@@ -144,6 +144,7 @@ function applySnapshot(snapshot) {
     upsertSession(session, false);
   }
 
+  state.ledPanels.clear();
   for (const panel of snapshot.ledPanels || []) {
     state.ledPanels.set(panel.panelId, { ...panel, flashUntil: 0 });
   }

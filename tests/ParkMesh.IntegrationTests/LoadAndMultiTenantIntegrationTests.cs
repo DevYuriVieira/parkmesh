@@ -210,6 +210,7 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
         Assert.Contains("id=\"auditTenantLabel\"", html);
         var js = await client.GetStringAsync("/app.js");
         Assert.Contains("SubscribeTenant", js);
+        Assert.Contains("state.ledPanels.clear()", js);
     }
 
     [Fact]
