@@ -27,7 +27,7 @@ public sealed class SensorReadingFilter : ISensorReadingFilter
         public DateTimeOffset PendingSinceUtc;
     }
 
-    private readonly ConcurrentDictionary<string, BayState> _states = new(StringComparer.OrdinalIgnoreCase);
+    private readonly ConcurrentDictionary<(string Tenant, string Bay), BayState> _states = new();
     private readonly int _minConsecutiveReadings;
     private readonly TimeSpan _stabilityWindow;
 
@@ -43,7 +43,8 @@ public sealed class SensorReadingFilter : ISensorReadingFilter
         ArgumentNullException.ThrowIfNull(reading);
         ArgumentException.ThrowIfNullOrWhiteSpace(reading.BayId);
 
-        var state = _states.GetOrAdd(reading.BayId, static _ => new BayState());
+        var key = (reading.TenantId ?? "default", reading.BayId.ToUpperInvariant());
+        var state = _states.GetOrAdd(key, static _ => new BayState());
 
         lock (state.Sync)
         {

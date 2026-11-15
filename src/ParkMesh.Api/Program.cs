@@ -113,6 +113,13 @@ if (!app.Environment.IsDevelopment() &&
         "Security:ApiKey must be configured outside Development unless Security:AllowUnauthenticatedProduction=true.");
 }
 
+if (!app.Environment.IsDevelopment() && startupSecurity.AllowedTenants is not { Length: > 0 })
+{
+    // Each tenant allocates an in-memory garage; an open tenant set is an unbounded memory sink.
+    throw new InvalidOperationException(
+        "Security:AllowedTenants must list at least one tenant outside Development.");
+}
+
 app.UseMiddleware<SecurityHeadersMiddleware>();
 app.UseExceptionHandler(errorApp =>
 {
@@ -369,9 +376,11 @@ app.MapGet("/api/parking/telemetry/metrics", (ITelemetryIngestionChannel channel
 
 app.MapPost("/api/parking/telemetry/readings", (
     BaySensorReading reading,
+    ITenantContext tenantContext,
     ITelemetryIngestionChannel channel) =>
 {
-    var enqueued = channel.TryEnqueue(reading);
+    // Tenant comes from the validated X-Tenant-Id header, never from the payload.
+    var enqueued = channel.TryEnqueue(reading with { TenantId = tenantContext.CurrentTenantId });
     return enqueued ? Results.Accepted() : Results.StatusCode(StatusCodes.Status503ServiceUnavailable);
 }).AddEndpointFilter<ApiKeyEndpointFilter>();
 

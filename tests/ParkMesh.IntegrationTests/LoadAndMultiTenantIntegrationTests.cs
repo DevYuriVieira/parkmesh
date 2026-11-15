@@ -61,6 +61,13 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
         var alphaReadTask = PumpFramesAsync(wsAlpha, alphaFrames, cts.Token);
         var betaReadTask = PumpFramesAsync(wsBeta, betaFrames, cts.Token);
 
+        // A tenant only gets a runtime (and MetricsTick) once it is touched; touch beta so its tick isolation is asserted non-vacuously.
+        using (var betaTouch = new HttpRequestMessage(HttpMethod.Get, "/api/parking/snapshot"))
+        {
+            betaTouch.Headers.Add("X-Tenant-Id", "tenant-beta");
+            Assert.Equal(HttpStatusCode.OK, (await client.SendAsync(betaTouch, cts.Token)).StatusCode);
+        }
+
         using var allocAlpha = new HttpRequestMessage(HttpMethod.Post, "/api/parking/allocations")
         {
             Content = JsonContent.Create(new { GateId = "GATE-N1", VehicleSessionId = "SIG-ALPHA-1", VehicleType = VehicleType.Standard }, options: JsonOptions)
@@ -75,8 +82,13 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
             await Task.Delay(25, cts.Token);
         }
 
-        // Wait past one metrics broadcast interval (1s) so MetricsTick isolation is also verified
-        await Task.Delay(1100, cts.Token);
+        // Wait for at least one MetricsTick on the isolated tenant (1s broadcast interval) instead of a fixed sleep
+        deadline = DateTime.UtcNow.AddSeconds(5);
+        while (!betaFrames.Any(f => f.Contains("\"MetricsTick\"", StringComparison.Ordinal)) && DateTime.UtcNow < deadline)
+        {
+            await Task.Delay(25, cts.Token);
+        }
+        Assert.Contains(betaFrames, f => f.Contains("\"MetricsTick\"", StringComparison.Ordinal));
 
         Assert.Contains(alphaFrames, f => f.Contains("\"RouteAssigned\"", StringComparison.Ordinal) && f.Contains("SIG-ALPHA-1", StringComparison.Ordinal));
         Assert.DoesNotContain(betaFrames, f => f.Contains("SIG-ALPHA-1", StringComparison.Ordinal));
@@ -231,6 +243,22 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
 
         Assert.Throws<InvalidOperationException>(() => insecureProd.CreateClient());
 
+        using var openTenantsProd = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Production");
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Security:ApiKey"] = "prod-secret-key",
+                    ["Mqtt:Enabled"] = "false"
+                });
+            });
+        });
+
+        // Without an explicit tenant allowlist every X-Tenant-Id would allocate a garage in memory.
+        Assert.Throws<InvalidOperationException>(() => openTenantsProd.CreateClient());
+
         using var securedProd = _factory.WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -239,6 +267,7 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
                 config.AddInMemoryCollection(new Dictionary<string, string?>
                 {
                     ["Security:ApiKey"] = "prod-secret-key",
+                    ["Security:AllowedTenants:0"] = "default",
                     ["Security:EnableChaosEndpoints"] = "false",
                     ["Mqtt:Enabled"] = "false"
                 });

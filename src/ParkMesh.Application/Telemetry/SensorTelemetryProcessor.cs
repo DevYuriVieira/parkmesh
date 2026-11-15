@@ -1,4 +1,5 @@
 using Microsoft.Extensions.Logging;
+using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 
 namespace ParkMesh.Application.Telemetry;
@@ -15,13 +16,16 @@ public sealed class SensorTelemetryProcessor : ISensorTelemetryProcessor
     private readonly ISensorReadingFilter _filter;
     private readonly IParkingAllocationService _allocationService;
     private readonly ILogger<SensorTelemetryProcessor> _logger;
+    private readonly ITenantContext? _tenantContext;
 
     public SensorTelemetryProcessor(
         ITelemetryIngestionChannel channel,
         ISensorReadingFilter filter,
         IParkingAllocationService allocationService,
-        ILogger<SensorTelemetryProcessor> logger)
+        ILogger<SensorTelemetryProcessor> logger,
+        ITenantContext? tenantContext = null)
     {
+        _tenantContext = tenantContext;
         _channel = channel;
         _filter = filter;
         _allocationService = allocationService;
@@ -38,6 +42,10 @@ public sealed class SensorTelemetryProcessor : ISensorTelemetryProcessor
 
         try
         {
+            using var tenantScope = reading.TenantId is { } tenantId && _tenantContext is not null
+                ? _tenantContext.BeginScope(tenantId)
+                : null;
+
             var result = await _allocationService.ReconcilePhysicalOccupancyAsync(
                 reading.BayId,
                 reading.Occupied,
