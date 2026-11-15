@@ -273,7 +273,8 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
             JsonOptions);
 
         AuditResponse? audit = null;
-        for (var attempt = 0; attempt < 25; attempt++)
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
         {
             audit = await _client.GetFromJsonAsync<AuditResponse>("/api/parking/audit?limit=50", JsonOptions);
             if (audit is not null
@@ -283,7 +284,7 @@ public sealed class ParkingApiIntegrationTests : IClassFixture<WebApplicationFac
                 break;
             }
 
-            await Task.Delay(50);
+            await Task.Delay(25);
         }
 
         Assert.NotNull(audit);

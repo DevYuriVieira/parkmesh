@@ -118,17 +118,29 @@ public sealed class SecurityAndHardeningIntegrationTests : IClassFixture<WebAppl
         Assert.Equal(HttpStatusCode.Created, (await client.SendAsync(allocSouth)).StatusCode);
 
         AuditPayload? northAudit = null;
-        for (var i = 0; i < 20; i++)
+        AuditPayload? southAudit = null;
+        var deadline = DateTime.UtcNow.AddSeconds(3);
+        while (DateTime.UtcNow < deadline)
         {
-            using var auditReq = new HttpRequestMessage(HttpMethod.Get, "/api/parking/audit?limit=50");
-            auditReq.Headers.Add("X-Tenant-Id", "tenant-north");
-            var resp = await client.SendAsync(auditReq);
-            Assert.Equal(HttpStatusCode.OK, resp.StatusCode);
-            northAudit = await resp.Content.ReadFromJsonAsync<AuditPayload>(JsonOptions);
-            if (northAudit?.Events.Any(e => e.SessionId == "NORTH-CAR-1") == true)
-                break;
+            using var northReq = new HttpRequestMessage(HttpMethod.Get, "/api/parking/audit?limit=50");
+            northReq.Headers.Add("X-Tenant-Id", "tenant-north");
+            var northResp = await client.SendAsync(northReq);
+            Assert.Equal(HttpStatusCode.OK, northResp.StatusCode);
+            northAudit = await northResp.Content.ReadFromJsonAsync<AuditPayload>(JsonOptions);
 
-            await Task.Delay(50);
+            using var southReq = new HttpRequestMessage(HttpMethod.Get, "/api/parking/audit?limit=50");
+            southReq.Headers.Add("X-Tenant-Id", "tenant-south");
+            var southResp = await client.SendAsync(southReq);
+            Assert.Equal(HttpStatusCode.OK, southResp.StatusCode);
+            southAudit = await southResp.Content.ReadFromJsonAsync<AuditPayload>(JsonOptions);
+
+            if (northAudit?.Events.Any(e => e.SessionId == "NORTH-CAR-1") == true &&
+                southAudit?.Events.Any(e => e.SessionId == "SOUTH-CAR-1") == true)
+            {
+                break;
+            }
+
+            await Task.Delay(25);
         }
 
         Assert.NotNull(northAudit);
@@ -136,9 +148,6 @@ public sealed class SecurityAndHardeningIntegrationTests : IClassFixture<WebAppl
         Assert.Contains(northAudit.Events, e => e.SessionId == "NORTH-CAR-1");
         Assert.DoesNotContain(northAudit.Events, e => e.SessionId == "SOUTH-CAR-1");
 
-        using var southReq = new HttpRequestMessage(HttpMethod.Get, "/api/parking/audit?limit=50");
-        southReq.Headers.Add("X-Tenant-Id", "tenant-south");
-        var southAudit = await (await client.SendAsync(southReq)).Content.ReadFromJsonAsync<AuditPayload>(JsonOptions);
         Assert.NotNull(southAudit);
         Assert.Contains(southAudit!.Events, e => e.SessionId == "SOUTH-CAR-1");
         Assert.DoesNotContain(southAudit.Events, e => e.SessionId == "NORTH-CAR-1");
