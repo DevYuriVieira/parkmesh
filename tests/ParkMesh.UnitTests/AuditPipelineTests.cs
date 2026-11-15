@@ -129,4 +129,78 @@ public sealed class AuditPipelineTests
         public Task<bool> CheckConnectivityAsync(CancellationToken ct = default) =>
             Inner.CheckConnectivityAsync(ct);
     }
+
+    [Fact]
+    public async Task ParkingAuditHostedService_SurvivesTransientStoreFailureAndPersistsSubsequentBatch()
+    {
+        var sink = new AuditChannelSink(128);
+        var store = new TransientFailingAuditStore();
+        var service = new ParkingAuditHostedService(sink, store, NullLogger<ParkingAuditHostedService>.Instance);
+
+        await service.StartAsync(CancellationToken.None);
+        await store.Initialized.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var t0 = DateTimeOffset.UtcNow;
+        Assert.True(sink.TryEnqueue(new ParkingAuditEvent(
+            t0,
+            AuditEventType.BayAllocated,
+            "F0-B01",
+            "DURING-OUTAGE",
+            1,
+            VehicleType.Standard,
+            "GATE-N1",
+            null)));
+
+        await store.FirstBatchFailed.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.True(sink.TryEnqueue(new ParkingAuditEvent(
+            t0.AddSeconds(1),
+            AuditEventType.BayAllocated,
+            "F0-B02",
+            "AFTER-OUTAGE",
+            2,
+            VehicleType.Standard,
+            "GATE-N1",
+            null)));
+
+        await store.SecondBatchPersisted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+        await service.StopAsync(CancellationToken.None);
+
+        var persisted = await store.Inner.GetRecentAsync(10);
+        Assert.Contains(persisted, e => e.SessionId == "AFTER-OUTAGE");
+        Assert.DoesNotContain(persisted, e => e.SessionId == "DURING-OUTAGE");
+    }
+
+    private sealed class TransientFailingAuditStore : IParkingAuditStore
+    {
+        public InMemoryParkingAuditStore Inner { get; } = new();
+        public TaskCompletionSource Initialized { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource FirstBatchFailed { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource SecondBatchPersisted { get; } = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        private int _batchCount;
+
+        public Task InitializeAsync(CancellationToken ct = default)
+        {
+            Initialized.TrySetResult();
+            return Inner.InitializeAsync(ct);
+        }
+
+        public async Task RecordBatchAsync(IReadOnlyList<ParkingAuditEvent> events, CancellationToken ct = default)
+        {
+            if (Interlocked.Increment(ref _batchCount) == 1)
+            {
+                FirstBatchFailed.TrySetResult();
+                throw new InvalidOperationException("Simulated Postgres outage");
+            }
+
+            await Inner.RecordBatchAsync(events, ct);
+            SecondBatchPersisted.TrySetResult();
+        }
+
+        public Task<IReadOnlyList<ParkingAuditEvent>> GetRecentAsync(int limit = 50, CancellationToken ct = default) =>
+            Inner.GetRecentAsync(limit, ct);
+
+        public Task<bool> CheckConnectivityAsync(CancellationToken ct = default) =>
+            Inner.CheckConnectivityAsync(ct);
+    }
 }

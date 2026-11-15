@@ -10,6 +10,22 @@ public sealed record LatencyPercentiles(
     double P99Ms,
     int SampleCount);
 
+/// <summary>
+/// Mixed point-in-time snapshot combining per-tenant garage counts with process-global engine telemetry.
+/// </summary>
+/// <remarks>
+/// <para>
+/// <strong>Per-tenant fields:</strong> <see cref="TotalBays"/>, <see cref="FreeBays"/>,
+/// <see cref="LeasedBays"/>, <see cref="OccupiedBays"/>, <see cref="OutOfServiceBays"/>,
+/// and <see cref="ActiveSessions"/>.
+/// </para>
+/// <para>
+/// <strong>Process-global fields:</strong> <see cref="AllocationsTotal"/>,
+/// <see cref="ContentionRetriesTotal"/>, <see cref="ReroutesTotal"/>,
+/// <see cref="LeasesExpiredTotal"/>, <see cref="AStarLatency"/>,
+/// <see cref="RedisLeaseLatency"/>, and <see cref="Telemetry"/>.
+/// </para>
+/// </remarks>
 public sealed record EngineMetricsSnapshot(
     int TotalBays,
     int FreeBays,

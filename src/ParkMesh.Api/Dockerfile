@@ -1,7 +1,7 @@
 FROM mcr.microsoft.com/dotnet/sdk:10.0 AS build
 WORKDIR /src
 
-COPY Directory.Build.props ./
+COPY Directory.Build.props Directory.Packages.props ./
 COPY src/ParkMesh.Domain/ParkMesh.Domain.csproj src/ParkMesh.Domain/
 COPY src/ParkMesh.Application/ParkMesh.Application.csproj src/ParkMesh.Application/
 COPY src/ParkMesh.Infrastructure/ParkMesh.Infrastructure.csproj src/ParkMesh.Infrastructure/

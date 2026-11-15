@@ -7,7 +7,7 @@
 ```mermaid
 flowchart LR
     Sim["ParkMesh.Simulator\n(Vehicles, Noise, Intruders)"] -->|MQTT Raw Telemetry| Mosq["Eclipse Mosquitto\n(MQTT Broker)"]
-    Mosq -->|parkmesh/v1/.../telemetry| Worker["ParkMesh.TelemetryWorker\n(BoundedChannel + Anti-Flapping)"]
+    Mosq -->|parkmesh/sensors/...| Worker["ParkMesh.TelemetryWorker\n(BoundedChannel + Anti-Flapping)"]
     Worker -->|Confirmed Transitions HTTP| Api["ParkMesh.Api\n(Allocation Engine + SignalR + OTel)"]
     Api <-->|Atomic Lua SET NX + Fencing Token| Redis["Redis\n(Distributed Leases & Ephemeral State)"]
     Api -->|MQTT LED Commands| Mosq
@@ -64,7 +64,7 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 ### 3.4 Real-Time Delta Streaming, Chaos Engineering & OpenTelemetry
 
 - **SignalR Hub (`/hubs/parking`)**:
-  - Client call: `GetParkingSnapshot()` returns full initial graph geometry, floor list, gates, active sessions, bay states, and metrics snapshot.
+  - Client calls: `GetParkingSnapshot()` returns full initial graph geometry, floor list, gates, active sessions, bay states, and metrics snapshot for the active tenant; `SubscribeTenant(tenantId)` validates tenant access and switches the connection's `tenant:{id}` broadcast group.
   - Server-to-client delta events emitted by `SignalRParkingEventSink` and `MetricsBroadcastHostedService`:
     - `RouteAssigned`
     - `RouteReassigned` (including `displacedBayId`, `displacedSessionId`, and `newSession`)
@@ -81,7 +81,7 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 
 - **Asynchronous Audit Outbox & PostgreSQL RLS (`AuditChannelSink`, `PostgresParkingAuditStore`, `ParkingAuditHostedService`)**: Allocation, release, expiration, occupancy, and maintenance events enqueue non-blockingly into a bounded channel (`DropOldest`, capacity `8192`) stamped with the active `ITenantContext` (`X-Tenant-Id`, default `"default"`), draining all buffered batches completely on shutdown and flushing in per-tenant transactions using `SELECT set_config('app.current_tenant', @tenant_id, true)` (plus `SET LOCAL ROLE` when `Postgres:AppRole` is configured, provisioned via `infra/postgres/init-rls.sql`). The table enforces `ENABLE ROW LEVEL SECURITY` and `FORCE ROW LEVEL SECURITY` with a fail-closed `USING` / `WITH CHECK` policy (`NULLIF(current_setting('app.current_tenant', true), '')`), mirrored in `InMemoryParkingAuditStore` when PostgreSQL is unconfigured.
 - **Proactive Lease Sweeper (`LeaseExpirationSweeperHostedService`)**: Polls `PurgeExpiredSessionsAsync` every 2 seconds using `TimeProvider`, reclaiming abandoned leases under the session's tenant scope (`TenantId`), clearing edge congestion, and broadcasting `BayStateChanged` (`Free`) to SignalR clients.
-- **Multi-Tenant Leases, Startup Hydration & Edge Security**: `RedisBayLeaseManager` and `InMemoryBayLeaseManager` isolate lease keys and fencing counters per active tenant (`parkmesh:tenant:{tenantId}:...`), `ParkingAllocationService` isolates sessions by `(TenantId, VehicleSessionId)` and `GET /api/parking/sessions`, and `GarageStateHydrationHostedService` hydrates `default` plus any `Security:AllowedTenants` on startup. Constant-time SHA-256 `X-Api-Key` verification, strict `X-Tenant-Id` validation and allowlisting (`TenantResolutionMiddleware`), HTTP security headers + CSP (`SecurityHeadersMiddleware`), chaos rate limiting, and dashboard tenant switcher (`web/`) complete edge hardening.
+- **Multi-Tenant Leases, Startup Hydration & Edge Security**: Each tenant materializes an isolated `TenantRuntime` inside `ParkingAllocationService` (cloned `ParkingGraph`, dedicated `IEdgeCongestionTracker`, and `Lock`), `RedisBayLeaseManager` and `InMemoryBayLeaseManager` isolate lease keys and fencing counters per active tenant (`parkmesh:tenant:{tenantId}:...`), `ParkingAllocationService` isolates sessions by `(TenantId, VehicleSessionId)` and `GET /api/parking/sessions`, and `GarageStateHydrationHostedService` hydrates `default` plus any `Security:AllowedTenants` on startup. Constant-time SHA-256 `X-Api-Key` verification, strict `X-Tenant-Id` validation and allowlisting (`TenantResolutionMiddleware`), HTTP security headers + CSP (`SecurityHeadersMiddleware`), chaos rate limiting, and dashboard tenant switcher (`web/`) complete edge hardening.
 
 ---
 
@@ -113,9 +113,9 @@ Physical bay sensors suffer from reflection noise, pedestrians crossing bays, an
 
 ---
 
-## 5. Architecture Decision Records
+## 5. Architecture Decision Records & Operational Docs
 
-Key technical trade-offs are documented in `docs/adr/`:
+Key technical trade-offs and operational policies are documented in `docs/`:
 
 1. [ADR 0001 — Modular Monolith with Dedicated Edge Workers](adr/0001-modular-monolith-over-microservices.md)
 2. [ADR 0002 — Atomic Redis Lua Leases with Monotonic Fencing Tokens](adr/0002-redis-lua-leases-with-fencing-tokens.md)
@@ -124,3 +124,5 @@ Key technical trade-offs are documented in `docs/adr/`:
 5. [ADR 0005 — SignalR Delta Protocol and Zero-Build HTML5 Canvas Simulator](adr/0005-signalr-delta-protocol-and-zero-build-canvas.md)
 6. [ADR 0006 — Asynchronous Audit Outbox, Proactive Lease Reconciliation, and Edge Hardening](adr/0006-async-audit-outbox-and-lease-reconciliation.md)
 7. [ADR 0007 — Single-Pass Indexed Multi-Target Routing, Startup State Hydration, and Bay Maintenance Lifecycle](adr/0007-indexed-multi-target-routing-and-state-hydration.md)
+8. [ADR 0008 — Tenant as Isolated Logical Garage](adr/0008-tenant-as-isolated-logical-garage.md)
+9. [Threat Model](THREAT_MODEL.md) · [Operational Runbook](RUNBOOK.md) · [Capacity & SLO Baseline](CAPACITY.md) · [Contract & Schema Versioning Policy](CONTRACT_VERSIONING.md)

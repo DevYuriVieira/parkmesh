@@ -1,9 +1,11 @@
 using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using ParkMesh.Application.Abstractions;
 using ParkMesh.Application.Allocation;
 using ParkMesh.Application.Routing;
 using ParkMesh.Application.Telemetry;
 using ParkMesh.Domain;
+using ParkMesh.Infrastructure.Mqtt;
 using ParkMesh.Infrastructure.Redis;
 
 namespace ParkMesh.UnitTests;
@@ -151,5 +153,51 @@ public sealed class TelemetryPipelineTests
             Assert.Equal(BayStatus.Free, allocationService.Graph.BaysById["F0-B05"].Status);
         using (tenantContext.BeginScope("default"))
             Assert.Equal(BayStatus.Free, allocationService.Graph.BaysById["F0-B05"].Status);
+    }
+
+    [Fact]
+    public async Task SensorReadingFilter_AndProcessor_NormalizeBlankTenantIdToDefault()
+    {
+        var tenantContext = new AsyncLocalTenantContext();
+        var allocationService = new ParkingAllocationService(
+            StandardTopologyFactory.CreateStandardGarage(),
+            new AStarPathfinder(),
+            new InMemoryBayLeaseManager(tenantContext),
+            new InMemoryEdgeCongestionTracker(),
+            NullLogger<ParkingAllocationService>.Instance,
+            tenantContext: tenantContext);
+
+        var options = new SensorDebounceOptions { MinConsecutiveReadings = 2, StabilityWindowMs = 0 };
+        var filter = new SensorReadingFilter(options);
+        var processor = new SensorTelemetryProcessor(
+            new TelemetryIngestionChannel(options),
+            filter,
+            allocationService,
+            NullLogger<SensorTelemetryProcessor>.Instance,
+            tenantContext);
+
+        var t0 = DateTimeOffset.UtcNow;
+        Assert.Equal(SensorFilterOutcome.Debouncing, await processor.ProcessSingleAsync(new BaySensorReading("F0-B07", true, 40, 1, t0, "CAR-BLANK", "")));
+        // Seq 1 on whitespace TenantId shares the "default" debounce bucket and must be rejected as stale.
+        Assert.Equal(SensorFilterOutcome.StaleSequence, await processor.ProcessSingleAsync(new BaySensorReading("F0-B07", true, 40, 1, t0.AddSeconds(1), "CAR-BLANK", "   ")));
+        // Seq 2 with explicit "default" completes the transition and reconciles the default tenant.
+        Assert.Equal(SensorFilterOutcome.ConfirmedTransition, await processor.ProcessSingleAsync(new BaySensorReading("F0-B07", true, 40, 2, t0.AddSeconds(2), "CAR-BLANK", "default")));
+
+        using (tenantContext.BeginScope("default"))
+            Assert.Equal(BayStatus.Occupied, allocationService.Graph.BaysById["F0-B07"].Status);
+    }
+
+    [Fact]
+    public async Task MqttConnectionManager_EnsureConnectedAsync_ReturnsFalseWhenBrokerUnreachable()
+    {
+        await using var manager = new MqttConnectionManager(
+            Options.Create(new MqttOptions { Enabled = true, Host = "127.0.0.1", Port = 1 }),
+            NullLogger<MqttConnectionManager>.Instance);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
+        var connected = await manager.EnsureConnectedAsync(cts.Token);
+
+        Assert.False(connected);
+        Assert.False(manager.IsConnected);
     }
 }

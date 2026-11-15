@@ -31,8 +31,97 @@ jobs:
       - name: Build container images (API, TelemetryWorker, Simulator)
         run: docker compose -f infra/docker-compose.yml --profile full build
 
+      - name: Smoke test API container as non-root USER app
+        run: |
+          set -euo pipefail
+          cleanup() {
+            rc=$?
+            if [ "$rc" -ne 0 ]; then
+              docker logs parkmesh-api-smoke || true
+            fi
+            docker rm -f parkmesh-api-smoke >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          docker compose -f infra/docker-compose.yml run -d --no-deps --name parkmesh-api-smoke -p 5150:8080 \
+            -e ASPNETCORE_ENVIRONMENT=Development \
+            -e ConnectionStrings__Redis= \
+            -e ConnectionStrings__Postgres= \
+            -e Mqtt__Enabled=false \
+            parkmesh-api
+
+          uid=$(docker exec parkmesh-api-smoke id -u)
+          echo "Container running with UID=$uid"
+          if [ "$uid" = "0" ]; then
+            echo "ERROR: Container is running as root (UID 0)"
+            exit 1
+          fi
+
+          for i in $(seq 1 45); do
+            if curl -fsS http://127.0.0.1:5150/health/ready; then
+              echo ""
+              echo "API container readiness passed on attempt $i"
+              exit 0
+            fi
+            sleep 1
+          done
+
+          echo "ERROR: API container failed /health/ready within 45s"
+          exit 1
+
       - name: Run unit tests
-        run: dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build --verbosity normal
+        run: dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build --collect:"XPlat Code Coverage" --results-directory ./TestResults/unit --verbosity normal
 
       - name: Run full integration suite (API, OpenAPI, SignalR, Testcontainers Redis & Postgres)
-        run: dotnet test tests/ParkMesh.IntegrationTests/ParkMesh.IntegrationTests.csproj -c Release --no-build --verbosity normal
+        run: dotnet test tests/ParkMesh.IntegrationTests/ParkMesh.IntegrationTests.csproj -c Release --no-build --collect:"XPlat Code Coverage" --results-directory ./TestResults/integration --verbosity normal
+
+      - name: Summarize code coverage
+        shell: python3 {0}
+        run: |
+          import glob
+          import os
+          import xml.etree.ElementTree as ET
+
+          rows = []
+          all_lines = set()
+          hit_lines = set()
+
+          for suite in ("unit", "integration"):
+              files = sorted(glob.glob(f"TestResults/{suite}/**/coverage.cobertura.xml", recursive=True))
+              if not files:
+                  continue
+              tree = ET.parse(files[0])
+              root = tree.getroot()
+              line_pct = float(root.attrib.get("line-rate", "0")) * 100.0
+              branch_pct = float(root.attrib.get("branch-rate", "0")) * 100.0
+              rows.append((suite, line_pct, branch_pct))
+              for pkg in root.findall("./packages/package"):
+                  pkg_name = pkg.attrib.get("name", "")
+                  for cls in pkg.findall("./classes/class"):
+                      filename = cls.attrib.get("filename", "")
+                      for line in cls.findall("./lines/line"):
+                          key = (pkg_name, filename, line.attrib.get("number", ""))
+                          all_lines.add(key)
+                          if int(line.attrib.get("hits", "0")) > 0:
+                              hit_lines.add(key)
+
+          combined_pct = (len(hit_lines) / len(all_lines) * 100.0) if all_lines else 0.0
+          lines_out = [
+              "### Code Coverage Summary (Cobertura)",
+              "",
+              "| Suite | Line Coverage | Branch Coverage |",
+              "|---|---:|---:|",
+          ]
+          for suite, line_pct, branch_pct in rows:
+              lines_out.append(f"| `{suite}` | {line_pct:.1f}% | {branch_pct:.1f}% |")
+          lines_out.append(f"| **Combined unique lines** | **{combined_pct:.1f}% ({len(hit_lines)}/{len(all_lines)})** | - |")
+          summary = "\n".join(lines_out) + "\n"
+          print(summary)
+
+          summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+          if summary_path:
+              with open(summary_path, "a", encoding="utf-8") as fh:
+                  fh.write(summary)
+
+      - name: Run load benchmark SLO gate
+        run: dotnet run --project benchmarks/ParkMesh.Benchmarks/ParkMesh.Benchmarks.csproj -c Release --no-build -- --load --concurrency 16 --requests 300 --slo benchmarks/ParkMesh.Benchmarks/slo-baseline.json

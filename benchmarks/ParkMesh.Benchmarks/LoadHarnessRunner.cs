@@ -30,6 +30,7 @@ public static class LoadHarnessRunner
         var concurrency = ParseIntArg(args, "--concurrency", 16, 1, 128);
         var iterations = ParseIntArg(args, "--requests", 200, 10, 50_000);
         var baseUrl = ParseStringArg(args, "--baseUrl");
+        var sloPath = ParseStringArg(args, "--slo");
 
         WebApplicationFactory<Program>? factory = null;
         HttpClient? sharedClient = null;
@@ -240,18 +241,41 @@ public static class LoadHarnessRunner
             var elapsedSec = Math.Max(0.001, swTotal.Elapsed.TotalSeconds);
             var inv = CultureInfo.InvariantCulture;
 
+            var p50Ms = sorted.Length > 0 ? Percentile(sorted, 0.50) : 0;
+            var p95Ms = sorted.Length > 0 ? Percentile(sorted, 0.95) : 0;
+            var p99Ms = sorted.Length > 0 ? Percentile(sorted, 0.99) : 0;
+            var maxMs = sorted.Length > 0 ? sorted[^1] : 0;
+            var throughputRps = httpRequests / elapsedSec;
+            var deliveredFrames = Interlocked.Read(ref signalrFrames);
+
             Console.WriteLine("=== ParkMesh Concurrent HTTP + SignalR Load Report ===");
             Console.WriteLine($"Target        : {(string.IsNullOrWhiteSpace(baseUrl) ? "In-Process WebApplicationFactory" : baseUrl)}");
             Console.WriteLine($"Concurrency   : {concurrency} workers | Cycles requested: {iterations}");
             Console.WriteLine(string.Create(inv, $"Elapsed       : {swTotal.Elapsed.TotalMilliseconds:F1} ms"));
-            Console.WriteLine(string.Create(inv, $"HTTP Requests : {httpRequests} ({httpRequests / elapsedSec:F1} req/s)"));
+            Console.WriteLine(string.Create(inv, $"HTTP Requests : {httpRequests} ({throughputRps:F1} req/s)"));
             Console.WriteLine($"Allocations   : {allocSucceeded} ok | {idempotentVerified} idempotent retries | {conflicts} conflicts | {errors} errors");
-            Console.WriteLine($"SignalR Deltas: {Interlocked.Read(ref signalrFrames)} JSON invocation frames delivered");
+            Console.WriteLine($"SignalR Deltas: {deliveredFrames} JSON invocation frames delivered");
             if (sorted.Length > 0)
             {
                 Console.WriteLine(string.Create(
                     inv,
-                    $"Latency (ms)  : min={sorted[0]:F2} | P50={Percentile(sorted, 0.50):F2} | P95={Percentile(sorted, 0.95):F2} | P99={Percentile(sorted, 0.99):F2} | max={sorted[^1]:F2}"));
+                    $"Latency (ms)  : min={sorted[0]:F2} | P50={p50Ms:F2} | P95={p95Ms:F2} | P99={p99Ms:F2} | max={maxMs:F2}"));
+            }
+
+            if (!string.IsNullOrWhiteSpace(sloPath))
+            {
+                var sloOk = await EvaluateSloAsync(
+                    sloPath,
+                    p95Ms,
+                    p99Ms,
+                    throughputRps,
+                    allocSucceeded,
+                    idempotentVerified,
+                    conflicts,
+                    errors,
+                    deliveredFrames);
+                if (!sloOk)
+                    return 2;
             }
 
             return errors == 0 ? 0 : 1;
@@ -304,5 +328,68 @@ public static class LoadHarnessRunner
         return Encoding.UTF8.GetString(buffer, 0, res.Count);
     }
 
+    private static async Task<bool> EvaluateSloAsync(
+        string sloPath,
+        double p95Ms,
+        double p99Ms,
+        double throughputRps,
+        long allocSucceeded,
+        long idempotentVerified,
+        long conflicts,
+        long errors,
+        long signalrFrames)
+    {
+        if (!File.Exists(sloPath))
+        {
+            Console.Error.WriteLine($"SLO FAILED: Baseline file '{sloPath}' not found.");
+            return false;
+        }
+
+        await using var stream = File.OpenRead(sloPath);
+        var doc = await JsonSerializer.DeserializeAsync<SloBaselineFile>(stream, JsonOptions);
+        if (doc?.CiGate is null)
+        {
+            Console.Error.WriteLine($"SLO FAILED: Missing 'ciGate' section in '{sloPath}'.");
+            return false;
+        }
+
+        var g = doc.CiGate;
+        var inv = CultureInfo.InvariantCulture;
+        var failures = new List<string>();
+        if (p95Ms > g.MaxP95Ms) failures.Add(string.Create(inv, $"P95 {p95Ms:F2} ms > limit {g.MaxP95Ms:F2} ms"));
+        if (p99Ms > g.MaxP99Ms) failures.Add(string.Create(inv, $"P99 {p99Ms:F2} ms > limit {g.MaxP99Ms:F2} ms"));
+        if (throughputRps < g.MinThroughputRps) failures.Add(string.Create(inv, $"Throughput {throughputRps:F1} req/s < limit {g.MinThroughputRps:F1} req/s"));
+        if (allocSucceeded < g.MinAllocationsOk) failures.Add(string.Create(inv, $"AllocationsOk {allocSucceeded} < limit {g.MinAllocationsOk}"));
+        if (idempotentVerified < g.MinIdempotentVerified) failures.Add(string.Create(inv, $"IdempotentVerified {idempotentVerified} < limit {g.MinIdempotentVerified}"));
+        if (conflicts > g.MaxConflicts) failures.Add(string.Create(inv, $"Conflicts {conflicts} > limit {g.MaxConflicts}"));
+        if (errors > g.MaxErrors) failures.Add(string.Create(inv, $"Errors {errors} > limit {g.MaxErrors}"));
+        if (signalrFrames < g.MinSignalrFrames) failures.Add(string.Create(inv, $"SignalrFrames {signalrFrames} < limit {g.MinSignalrFrames}"));
+
+        if (failures.Count > 0)
+        {
+            Console.Error.WriteLine("SLO GATE FAILED:");
+            foreach (var f in failures)
+                Console.Error.WriteLine($"  - {f}");
+            return false;
+        }
+
+        Console.WriteLine(string.Create(
+            inv,
+            $"SLO Gate      : PASSED (P95={p95Ms:F2}<={g.MaxP95Ms:F2} ms, P99={p99Ms:F2}<={g.MaxP99Ms:F2} ms, RPS={throughputRps:F1}>={g.MinThroughputRps:F1}, conflicts={conflicts}, errors={errors})"));
+        return true;
+    }
+
     private sealed record AllocationEnvelope(ActiveVehicleSession? Session, double ComputationTimeMs);
+
+    private sealed record SloBaselineFile(SloGateThresholds? CiGate);
+
+    private sealed record SloGateThresholds(
+        double MaxP95Ms,
+        double MaxP99Ms,
+        double MinThroughputRps,
+        long MinAllocationsOk,
+        long MinIdempotentVerified,
+        long MaxConflicts,
+        long MaxErrors,
+        long MinSignalrFrames);
 }

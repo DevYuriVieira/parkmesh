@@ -259,6 +259,22 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
         // Without an explicit tenant allowlist every X-Tenant-Id would allocate a garage in memory.
         Assert.Throws<InvalidOperationException>(() => openTenantsProd.CreateClient());
 
+        using var invalidTenantsProd = _factory.WithWebHostBuilder(builder =>
+        {
+            builder.UseEnvironment("Production");
+            builder.ConfigureAppConfiguration((_, config) =>
+            {
+                config.AddInMemoryCollection(new Dictionary<string, string?>
+                {
+                    ["Security:ApiKey"] = "prod-secret-key",
+                    ["Security:AllowedTenants:0"] = "bad tenant!",
+                    ["Mqtt:Enabled"] = "false"
+                });
+            });
+        });
+
+        Assert.Throws<InvalidOperationException>(() => invalidTenantsProd.CreateClient());
+
         using var securedProd = _factory.WithWebHostBuilder(builder =>
         {
             builder.UseEnvironment("Production");
@@ -284,6 +300,7 @@ public sealed class LoadAndMultiTenantIntegrationTests : IClassFixture<WebApplic
         }
 
         // Unauthenticated operational reads and hub upgrade are rejected with 401
+        Assert.Equal(HttpStatusCode.Unauthorized, (await prodClient.GetAsync("/api/parking/topology")).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await prodClient.GetAsync("/api/parking/snapshot")).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await prodClient.GetAsync("/api/parking/metrics")).StatusCode);
         Assert.Equal(HttpStatusCode.Unauthorized, (await prodClient.GetAsync("/api/parking/sessions")).StatusCode);

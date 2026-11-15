@@ -42,8 +42,8 @@ public sealed class SensorTelemetryProcessor : ISensorTelemetryProcessor
 
         try
         {
-            using var tenantScope = reading.TenantId is { } tenantId && _tenantContext is not null
-                ? _tenantContext.BeginScope(tenantId)
+            using var tenantScope = !string.IsNullOrWhiteSpace(reading.TenantId) && _tenantContext is not null
+                ? _tenantContext.BeginScope(reading.TenantId)
                 : null;
 
             var result = await _allocationService.ReconcilePhysicalOccupancyAsync(

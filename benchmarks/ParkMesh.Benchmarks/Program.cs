@@ -6,6 +6,11 @@ internal static class BenchmarksEntry
 {
     public static async Task<int> Main(string[] args)
     {
+        if (args.Any(a => string.Equals(a, "--capacity", StringComparison.OrdinalIgnoreCase)))
+        {
+            return await CapacityProbe.RunAsync(args);
+        }
+
         if (args.Any(a => string.Equals(a, "--load", StringComparison.OrdinalIgnoreCase)))
         {
             return await LoadHarnessRunner.RunAsync(args);

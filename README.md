@@ -39,7 +39,11 @@ benchmarks/
   ParkMesh.Benchmarks/
 docs/
   ARCHITECTURE.md
-  adr/                            # ADRs 0001-0007
+  THREAT_MODEL.md
+  RUNBOOK.md
+  CAPACITY.md
+  CONTRACT_VERSIONING.md
+  adr/                            # ADRs 0001-0008
 .github/
   workflows/ci.yml
 ```
@@ -109,16 +113,27 @@ Microbenchmark numbers (`BenchmarkDotNet v0.15.8`, `.NET 10.0.11`, in-process sh
 | `TelemetryFilter_EvaluateReading` | ~58.7 ns (72 B) | `64.53 ns` | `72 B` |
 | `SlidingWindow_Compute1024Percentiles` | ~9.21 us (~8.1 KB) | `6.74 us` | `8,264 B` |
 
+Run the concurrent load gate and per-tenant memory probe in Release mode (`benchmarks/ParkMesh.Benchmarks`):
+
+```bash
+dotnet run --project benchmarks/ParkMesh.Benchmarks -c Release --no-build -- --load --concurrency 16 --requests 300 --slo benchmarks/ParkMesh.Benchmarks/slo-baseline.json
+dotnet run --project benchmarks/ParkMesh.Benchmarks -c Release --no-build -- --capacity --tenants 100
+```
+
 ## Security Model and Known Scope Limits
 
 - **Tenant Model:** Each tenant identifier (`X-Tenant-Id`, or `?tenantId=` on `/hubs/parking`) isolates an independent virtual garage instance (`ParkingGraph`, edge congestion, Redis lease namespace, PostgreSQL RLS audit rows, and SignalR group `tenant:{id}`). In demo/standalone mode (`Security:AllowedTenants` empty), callers self-declare `X-Tenant-Id`. When strong tenant authentication is needed across untrusted callers, pair `Security:ApiKey` / `Security:AllowedTenants` with upstream JWT/claim termination rather than trusting raw headers.
-- **Production Fail-Closed Defaults:** Outside `Development`, startup fails if `Security:ApiKey` is empty (unless `Security:AllowUnauthenticatedProduction=true`) or if `Security:AllowedTenants` is empty (every tenant allocates an in-memory garage, so an open set is an unbounded memory sink). `/api/parking/chaos/*` routes remain unmapped unless `Security:EnableChaosEndpoints=true`.
-- **Local Compose & MQTT Telemetry:** `infra/docker-compose.yml` configures `ASPNETCORE_ENVIRONMENT=Development` with local dev credentials and open ports strictly for local demos. `POST /api/parking/telemetry/readings` stamps the tenant from the validated `X-Tenant-Id` header and debounces per `(tenant, bay)`. MQTT sensor topics carry no tenant, so MQTT ingestion always targets the `default` tenant (any `TenantId` in the payload is discarded).
-- **Process-global metrics:** `MetricsTick` mixes per-tenant bay/session counts with process-global latency histograms, reroute/retry counters and telemetry channel counters.
+- **Production Fail-Closed Defaults:** Outside `Development`, startup fails if `Security:ApiKey` is empty (unless `Security:AllowUnauthenticatedProduction=true`), if `Security:AllowedTenants` is empty (every tenant allocates an in-memory garage, so an open set is an unbounded memory sink), or if any configured entry fails `TenantIdValidator.IsValid`. `ApiKeyEndpointFilter` protects `/api/parking/topology` alongside state, query, and mutation routes, while `/api/parking/chaos/*` routes remain unmapped unless `Security:EnableChaosEndpoints=true`.
+- **Local Compose & MQTT Telemetry:** `infra/docker-compose.yml` configures `ASPNETCORE_ENVIRONMENT=Development` with local dev credentials and open ports strictly for local demos. `POST /api/parking/telemetry/readings` stamps the tenant from the validated `X-Tenant-Id` header, and `SensorReadingFilter` / `SensorTelemetryProcessor` normalize missing or blank `TenantId` values to `default` and debounce per `(tenant, bay)`. MQTT sensor topics carry no tenant, so MQTT ingestion always targets the `default` tenant (any `TenantId` in the payload is discarded).
+- **Process-global metrics (`EngineMetricsSnapshot`) & idle `MetricsTick`:** `TotalBays`, `FreeBays`, `LeasedBays`, `OccupiedBays`, `OutOfServiceBays`, and `ActiveSessions` reflect the scoped tenant's garage, whereas `AllocationsTotal`, `ContentionRetriesTotal`, `ReroutesTotal`, `LeasesExpiredTotal`, `AStarLatency`, `RedisLeaseLatency`, and `Telemetry` remain process-global counters/histograms. `MetricsBroadcastHostedService` iterates `GetKnownTenants()`, so an idle tenant with only a raw `/hubs/parking` connection and no materialized `TenantRuntime` (created on the first HTTP request, `GetParkingSnapshot()`, or `SubscribeTenant()`) does not receive `1s` `MetricsTick` frames until initialized.
 
 ## Documentation
 
 - [Architecture Blueprint](docs/ARCHITECTURE.md)
+- [Threat Model](docs/THREAT_MODEL.md)
+- [Operational Runbook](docs/RUNBOOK.md)
+- [Capacity & SLO Baseline](docs/CAPACITY.md)
+- [Contract & Schema Versioning Policy](docs/CONTRACT_VERSIONING.md)
 - [ADR 0001: Modular Monolith with Dedicated Edge Workers](docs/adr/0001-modular-monolith-over-microservices.md)
 - [ADR 0002: Atomic Redis Lua Leases with Monotonic Fencing Tokens](docs/adr/0002-redis-lua-leases-with-fencing-tokens.md)
 - [ADR 0003: Multi-Floor A* Pathfinding with Admissible Euclidean Heuristic](docs/adr/0003-multi-floor-astar-with-admissible-heuristic.md)
@@ -126,3 +141,4 @@ Microbenchmark numbers (`BenchmarkDotNet v0.15.8`, `.NET 10.0.11`, in-process sh
 - [ADR 0005: SignalR Delta Protocol and Zero-Build HTML5 Canvas Simulator](docs/adr/0005-signalr-delta-protocol-and-zero-build-canvas.md)
 - [ADR 0006: Asynchronous Audit Outbox, Proactive Lease Reconciliation, and Edge Hardening](docs/adr/0006-async-audit-outbox-and-lease-reconciliation.md)
 - [ADR 0007: Single-Pass Indexed Multi-Target Routing, Startup State Hydration, and Bay Maintenance Lifecycle](docs/adr/0007-indexed-multi-target-routing-and-state-hydration.md)
+- [ADR 0008: Tenant as Isolated Logical Garage](docs/adr/0008-tenant-as-isolated-logical-garage.md)
