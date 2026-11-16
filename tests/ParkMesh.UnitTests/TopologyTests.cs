@@ -90,4 +90,27 @@ public sealed class TopologyTests
         Assert.Equal(0.0, tracker.GetPenalty("E-NORTH-2"));
         Assert.All(tracker.Snapshot().Values, v => Assert.Equal(0.0, v));
     }
+
+    [Fact]
+    public void StandardGarage_AllFloorsHaveDistinctLayouts_With40BaysPerFloor()
+    {
+        var graph = StandardTopologyFactory.CreateStandardGarage();
+
+        var coordsByFloor = Enumerable.Range(0, StandardTopologyFactory.FloorCount)
+            .Select(f => graph.BaysById.Values
+                .Where(b => b.Floor == f)
+                .Select(b => (b.X, b.Y))
+                .OrderBy(p => p)
+                .ToArray())
+            .ToArray();
+
+        Assert.All(coordsByFloor, coords => Assert.Equal(StandardTopologyFactory.BaysPerFloor, coords.Length));
+        Assert.NotEqual(coordsByFloor[0], coordsByFloor[1]);
+        Assert.NotEqual(coordsByFloor[1], coordsByFloor[2]);
+        Assert.NotEqual(coordsByFloor[0], coordsByFloor[2]);
+
+        Assert.Contains(graph.Nodes.Values, n => n.Floor == 0 && n.Id == "F0-I-M-E1");
+        Assert.Contains(graph.Nodes.Values, n => n.Floor == 2 && n.Id == "F2-I-WA-C");
+        Assert.DoesNotContain(graph.Nodes.Values, n => n.Floor == 2 && n.Id == "F2-I-M-C");
+    }
 }
