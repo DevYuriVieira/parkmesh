@@ -3,28 +3,53 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ParkMesh — Real-Time Smart Parking Engine</title>
+  <title>ParkMesh // Garage Operations Console</title>
   <link rel="stylesheet" href="styles.css" />
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <div class="brand-mark">PM</div>
-      <div>
-        <h1>ParkMesh</h1>
-        <p class="subtitle">Multi-Floor A* Routing · Redis Fencing Leases · IoT Telemetry</p>
+      <div class="brand-mark" aria-hidden="true">
+        <svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="1.6">
+          <rect x="3" y="3" width="18" height="18" rx="1.5" />
+          <path d="M3 10h18M9 3v18M15 10v11" stroke-opacity="0.45" />
+          <path d="M6 7h7l3 6h2" stroke="#d98a2b" stroke-width="2" stroke-linecap="square" />
+          <circle cx="18" cy="13" r="1.5" fill="#2f9e66" stroke="none" />
+        </svg>
+      </div>
+      <div class="brand-copy">
+        <div class="brand-title">
+          <h1>PARKMESH</h1>
+          <span class="brand-tag">BMS v1.1</span>
+        </div>
+        <p class="subtitle">Multi-Floor A* Routing · Fencing Leases · Telemetry Console</p>
       </div>
     </div>
 
-    <div class="floor-tabs" id="floorTabs">
-      <button class="floor-tab active" data-floor="0">Ground (F0) <span class="badge" id="floorBadge0">--</span></button>
-      <button class="floor-tab" data-floor="1">Level G1 (F1) <span class="badge" id="floorBadge1">--</span></button>
-      <button class="floor-tab" data-floor="2">Level G2 (F2) <span class="badge" id="floorBadge2">--</span></button>
+    <div class="floor-tabs" id="floorTabs" role="tablist" aria-label="Parking deck levels">
+      <button class="floor-tab active" data-floor="0" type="button" title="Floor 0 — Ground Entry (Shortcut: 1)">
+        <span class="floor-code">F0</span>
+        <span>Ground</span>
+        <span class="badge" id="floorBadge0">--</span>
+        <span class="badge-cars hidden" id="floorCars0" title="Active vehicles on F0">0</span>
+      </button>
+      <button class="floor-tab" data-floor="1" type="button" title="Floor 1 — Level G1 (Shortcut: 2)">
+        <span class="floor-code">F1</span>
+        <span>Level G1</span>
+        <span class="badge" id="floorBadge1">--</span>
+        <span class="badge-cars hidden" id="floorCars1" title="Active vehicles on F1">0</span>
+      </button>
+      <button class="floor-tab" data-floor="2" type="button" title="Floor 2 — Rooftop Atrium (Shortcut: 3)">
+        <span class="floor-code">F2</span>
+        <span>Rooftop G2</span>
+        <span class="badge" id="floorBadge2">--</span>
+        <span class="badge-cars hidden" id="floorCars2" title="Active vehicles on F2">0</span>
+      </button>
     </div>
 
     <div class="topbar-controls">
       <div class="tenant-control">
-        <label for="tenantSelect">Tenant</label>
+        <label for="tenantSelect">TENANT</label>
         <select id="tenantSelect" aria-label="Active tenant selector">
           <option value="default">default</option>
           <option value="garage-sp-01">garage-sp-01</option>
@@ -35,7 +60,7 @@
         <button id="applyTenantBtn" type="button" class="btn toggle small hidden">Apply</button>
       </div>
 
-      <div class="connection-status">
+      <div class="connection-status" title="SignalR WebSocket transport">
         <span class="dot" id="connDot"></span>
         <span id="connLabel">Connecting...</span>
       </div>
@@ -47,80 +72,129 @@
       <div class="canvas-toolbar">
         <div class="legend">
           <span class="legend-item"><i class="swatch free"></i>Free</span>
-          <span class="legend-item"><i class="swatch leased"></i>Leased (90s)</span>
+          <span class="legend-item"><i class="swatch leased"></i>Leased</span>
           <span class="legend-item"><i class="swatch occupied"></i>Occupied</span>
-          <span class="legend-item"><i class="swatch maintenance"></i>Out of Service</span>
-          <span class="legend-item"><i class="swatch car"></i>Active Vehicle</span>
-          <span class="legend-item"><i class="swatch led"></i>LED Panel</span>
+          <span class="legend-item"><i class="swatch maintenance"></i>Maint</span>
+          <span class="legend-item"><i class="swatch car"></i>Active</span>
+          <span class="legend-item"><i class="swatch led"></i>VMS LED</span>
         </div>
-        <span class="canvas-hint" id="canvasFloorTitle">Viewing Floor 0 — 40 Bays · Click any bay to toggle maintenance</span>
+
+        <div class="toolbar-right">
+          <div class="layer-toggles" role="group" aria-label="Canvas overlay controls">
+            <button class="btn chip active" id="routesToggleBtn" type="button" title="Toggle vector route overlays (Shortcut: R)">Routes</button>
+            <button class="btn chip" id="heatmapToggleBtn" type="button" title="Toggle live corridor congestion heatmap (Shortcut: H)">Heatmap</button>
+            <button class="btn chip" id="followToggleBtn" type="button" title="Auto-switch floor to follow pinned vehicle (Shortcut: F)">Auto-Follow</button>
+          </div>
+          <span class="canvas-hint" id="canvasFloorTitle">FLOOR 0 — CLICK STALL, CAR OR RAMP TO INTERACT</span>
+        </div>
       </div>
+
       <div class="canvas-wrap">
         <canvas id="garageCanvas"></canvas>
+      </div>
+
+      <div class="inspector-bar" id="inspectorBar">
+        <div class="inspector-empty" id="inspectorEmpty">
+          <span class="inspector-msg">Select a <strong>stall</strong>, <strong>active vehicle</strong>, or <strong>ramp portal</strong> on the blueprint to inspect or act.</span>
+          <span class="inspector-keys">
+            <kbd>1-3</kbd> Floors
+            <kbd>Space</kbd> Demo
+            <kbd>R</kbd> Routes
+            <kbd>H</kbd> Heatmap
+            <kbd>F</kbd> Follow
+            <kbd>Shift+Click</kbd> Quick Maint
+          </span>
+        </div>
+        <div class="inspector-active hidden" id="inspectorContent"></div>
       </div>
     </section>
 
     <aside class="sidebar">
-      <section class="card">
-        <h2>Live Chaos &amp; Traffic Controls</h2>
+      <section class="panel-section">
+        <div class="section-head">
+          <h2>Traffic Dispatch &amp; Faults</h2>
+          <span class="section-code">CTRL-01</span>
+        </div>
         <div class="control-row">
-          <select id="gateSelect">
-            <option value="GATE-N1">GATE-N1 (North)</option>
-            <option value="GATE-S1">GATE-S1 (South)</option>
-          </select>
-          <select id="vehicleTypeSelect">
-            <option value="Standard">Standard</option>
-            <option value="EV">EV (Electric)</option>
-            <option value="SUV">SUV</option>
-            <option value="Pcd">PCD</option>
-            <option value="Moto">Moto</option>
-          </select>
+          <div class="field">
+            <label for="gateSelect">Entry Gate</label>
+            <select id="gateSelect">
+              <option value="GATE-N1">GATE-N1 (North)</option>
+              <option value="GATE-S1">GATE-S1 (South)</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="vehicleTypeSelect">Vehicle Class</label>
+            <select id="vehicleTypeSelect">
+              <option value="Standard">Standard</option>
+              <option value="EV">EV (Electric)</option>
+              <option value="SUV">SUV</option>
+              <option value="Pcd">PCD</option>
+              <option value="Moto">Moto</option>
+            </select>
+          </div>
         </div>
         <div class="button-grid">
-          <button class="btn primary" id="spawnBtn">Spawn Vehicle</button>
-          <button class="btn danger" id="intruderBtn">Inject Intruder</button>
-          <button class="btn accent" id="burstBtn">Entry Burst (25)</button>
-          <button class="btn toggle" id="demoToggleBtn">Auto-Demo: OFF</button>
+          <button class="btn primary" id="spawnBtn" type="button">Spawn Vehicle</button>
+          <button class="btn danger" id="intruderBtn" type="button">Inject Intruder</button>
+          <button class="btn accent" id="burstBtn" type="button">Entry Burst (25)</button>
+          <button class="btn toggle" id="demoToggleBtn" type="button">Auto-Demo: OFF</button>
         </div>
       </section>
 
-      <section class="card">
-        <h2>Real-Time Engine Metrics</h2>
+      <section class="panel-section">
+        <div class="section-head">
+          <h2>Engine Telemetry</h2>
+          <span class="section-code">OTEL-02</span>
+        </div>
         <div class="kpi-grid">
           <div class="kpi">
-            <span class="kpi-label">Occupancy</span>
+            <span class="kpi-label">OCC</span>
             <strong class="kpi-value" id="kpiOccupancy">0%</strong>
           </div>
           <div class="kpi">
-            <span class="kpi-label">Active Cars</span>
+            <span class="kpi-label">ACTIVE</span>
             <strong class="kpi-value" id="kpiActive">0</strong>
           </div>
           <div class="kpi">
-            <span class="kpi-label">Reroutes</span>
+            <span class="kpi-label">REROUTES</span>
             <strong class="kpi-value warn" id="kpiReroutes">0</strong>
           </div>
           <div class="kpi">
-            <span class="kpi-label">Contention</span>
+            <span class="kpi-label">CONTEND</span>
             <strong class="kpi-value" id="kpiContention">0</strong>
           </div>
         </div>
 
         <div class="latency-table">
-          <div><span>A* P50 / P95 / P99</span><strong id="astarLatency">0 / 0 / 0 ms</strong></div>
-          <div><span>Redis Lease P50 / P95</span><strong id="redisLatency">0 / 0 ms</strong></div>
-          <div><span>MQTT Channel (Enq / Conf)</span><strong id="channelStats">0 / 0</strong></div>
-          <div><span>Bay States (F / L / O / M)</span><strong id="bayCounts">120 / 0 / 0 / 0</strong></div>
+          <div><span>A* Latency (P50/95/99)</span><strong id="astarLatency">0.00 / 0.00 / 0.00 ms</strong></div>
+          <div><span>Lease Store (P50 / P95)</span><strong id="redisLatency">0.00 / 0.00 ms</strong></div>
+          <div><span>Sensor Bus (Enq / Conf)</span><strong id="channelStats">0 / 0</strong></div>
+          <div><span>Bays (F / L / O / M)</span><strong id="bayCounts">120 / 0 / 0 / 0</strong></div>
         </div>
       </section>
 
-      <section class="card feed-card">
-        <h2>Live Domain Event Stream</h2>
+      <section class="panel-section fleet-section">
+        <div class="section-head">
+          <h2>Active En-Route Fleet</h2>
+          <span class="section-code" id="fleetCountCode">0 LIVE</span>
+        </div>
+        <div class="fleet-chips" id="fleetChips">
+          <span class="fleet-empty">No vehicles currently navigating</span>
+        </div>
+      </section>
+
+      <section class="panel-section feed-section">
+        <div class="section-head">
+          <h2>Domain Event Stream</h2>
+          <span class="section-code">HUB-03</span>
+        </div>
         <ul class="event-feed" id="eventFeed"></ul>
       </section>
 
-      <details class="card audit-card" id="auditDrawer">
+      <details class="panel-section audit-card" id="auditDrawer">
         <summary class="audit-summary">
-          <span>Durable Audit Log (<span id="auditTenantLabel">default</span>) <span class="badge" id="auditCountBadge">0</span></span>
+          <span>Audit Log (<span id="auditTenantLabel">default</span>) <span class="badge" id="auditCountBadge">0</span></span>
           <span class="audit-meta" id="auditDroppedLabel">dropped: 0</span>
         </summary>
         <div class="audit-toolbar">

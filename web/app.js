@@ -1,4 +1,18 @@
 import { SignalRLiteClient } from "./signalr-lite.js";
+import {
+  FLOOR_META,
+  drawDeckBackground,
+  drawDrivingCorridors,
+  drawFloorRampsAndGates
+} from "./floor-renderers.js";
+import {
+  getCanvasLayout,
+  hitTestCanvas,
+  drawParkingBays,
+  drawNodesAndVmsSigns,
+  drawActiveRoutesAndVehicles,
+  drawCadOverlay
+} from "./canvas-view.js";
 
 const state = {
   tenantId: "default",
@@ -6,17 +20,42 @@ const state = {
   nodesById: new Map(),
   edges: [],
   baysById: new Map(),
+  bayParentsById: new Map(),
   sessions: new Map(),
   ledPanels: new Map(),
+  gateFlashUntil: new Map(),
+  departingGhosts: [],
   metrics: null,
   autoDemo: false,
   demoTimer: null,
-  demoSeq: 1,
   demoCounter: 1,
-  hoveredBayId: null
+  hoveredBayId: null,
+  hoveredSessionId: null,
+  hoveredRampId: null,
+  hoveredVmsId: null,
+  hoveredItem: null,
+  selectedBayId: null,
+  selectedSessionId: null,
+  options: {
+    showRoutes: true,
+    showHeatmap: false,
+    autoFollowFloor: false
+  }
 };
 
 const TENANT_REGEX = /^[a-zA-Z0-9][a-zA-Z0-9_-]{0,63}$/;
+
+const canvas = document.getElementById("garageCanvas");
+const ctx = canvas.getContext("2d");
+const connDot = document.getElementById("connDot");
+const connLabel = document.getElementById("connLabel");
+const eventFeed = document.getElementById("eventFeed");
+const inspectorEmptyEl = document.getElementById("inspectorEmpty");
+const inspectorContentEl = document.getElementById("inspectorContent");
+const fleetChipsEl = document.getElementById("fleetChips");
+const fleetCountCodeEl = document.getElementById("fleetCountCode");
+
+const client = new SignalRLiteClient("/hubs/parking");
 
 function apiFetch(url, options = {}) {
   const headers = new Headers(options.headers || {});
@@ -24,57 +63,90 @@ function apiFetch(url, options = {}) {
   return fetch(url, { ...options, headers });
 }
 
-const canvas = document.getElementById("garageCanvas");
-const ctx = canvas.getContext("2d");
-const connDot = document.getElementById("connDot");
-const connLabel = document.getElementById("connLabel");
-const eventFeed = document.getElementById("eventFeed");
-
-const client = new SignalRLiteClient("/hubs/parking");
-
 client.onStateChange((connState) => {
   connDot.className = `dot ${connState === "connected" ? "connected" : connState === "disconnected" ? "disconnected" : ""}`;
-  connLabel.textContent = connState === "connected" ? "SignalR Live" : connState === "disconnected" ? "Reconnecting..." : "Error";
+  connLabel.textContent = connState === "connected" ? "SIGNALR LIVE" : connState === "disconnected" ? "RECONNECTING" : "ERROR";
 });
 
 client.on("RouteAssigned", (session) => {
   upsertSession(session, false);
-  logEvent(`Assigned ${session.vehicleSessionId} (${session.vehicleType}) -> ${session.assignedBayId} (fence=${session.fencingToken})`, "assigned");
+  const bay = state.baysById.get(session.assignedBayId);
+  if (bay) {
+    bay.fencingToken = session.fencingToken;
+  }
+  const startNodeId = session.route?.nodeIds?.[0];
+  if (startNodeId === "GATE-N1" || startNodeId === "GATE-S1") {
+    state.gateFlashUntil.set(startNodeId, performance.now() + 1400);
+  }
+  logEvent(
+    `Assigned ${session.vehicleSessionId} (${session.vehicleType}) -> ${session.assignedBayId} [fence:${session.fencingToken}]`,
+    "assigned",
+    { sessionId: session.vehicleSessionId, bayId: session.assignedBayId }
+  );
+  refreshLiveUi();
 });
 
 client.on("RouteReassigned", (payload) => {
   const displacedBay = state.baysById.get(payload.displacedBayId);
   const trigger = displacedBay?.status === "OutOfService" ? "MAINT" : "INTRUDER";
   if (payload.newSession) {
+    const wasSelected = state.selectedSessionId === payload.displacedSessionId;
     upsertSession(payload.newSession, true);
-    logEvent(`${trigger} on ${payload.displacedBayId}! Rerouted ${payload.displacedSessionId} -> ${payload.newSession.assignedBayId}`, "reroute");
+    const nextBay = state.baysById.get(payload.newSession.assignedBayId);
+    if (nextBay) {
+      nextBay.fencingToken = payload.newSession.fencingToken;
+    }
+    if (wasSelected) {
+      state.selectedSessionId = payload.newSession.vehicleSessionId;
+    }
+    logEvent(
+      `${trigger} @ ${payload.displacedBayId} -> rerouted ${payload.displacedSessionId} to ${payload.newSession.assignedBayId}`,
+      "reroute",
+      { sessionId: payload.newSession.vehicleSessionId, bayId: payload.newSession.assignedBayId }
+    );
   } else {
     state.sessions.delete(payload.displacedSessionId);
-    logEvent(`${trigger} on ${payload.displacedBayId}! No alternative bay available for ${payload.displacedSessionId}`, "reroute");
+    if (state.selectedSessionId === payload.displacedSessionId) {
+      state.selectedSessionId = null;
+    }
+    logEvent(
+      `${trigger} @ ${payload.displacedBayId} -> no alternative bay for ${payload.displacedSessionId}`,
+      "reroute",
+      { bayId: payload.displacedBayId }
+    );
   }
+  refreshLiveUi();
 });
 
 client.on("BayStateChanged", (delta) => {
   const bay = state.baysById.get(delta.bayId);
   if (!bay) return;
 
+  const wasOccupied = bay.status === "Occupied";
   bay.status = delta.status;
   bay.currentSessionId = delta.sessionId;
   bay.leaseExpiresAtUtc = delta.leaseExpiresAtUtc;
+
+  if (wasOccupied && delta.status === "Free") {
+    spawnDepartureGhost(bay);
+  }
 
   if (delta.status === "Free" || delta.status === "OutOfService") {
     for (const [sid, s] of state.sessions.entries()) {
       if (s.assignedBayId === delta.bayId) {
         state.sessions.delete(sid);
+        if (state.selectedSessionId === sid) {
+          state.selectedSessionId = null;
+        }
       }
     }
   }
 
   if (delta.status === "Occupied" || delta.status === "Free" || delta.status === "OutOfService") {
-    logEvent(`Bay ${delta.bayId} -> ${delta.status}`, delta.status.toLowerCase());
+    logEvent(`Bay ${delta.bayId} -> ${delta.status}`, delta.status.toLowerCase(), { bayId: delta.bayId });
   }
 
-  updateFloorBadges();
+  refreshLiveUi();
 });
 
 client.on("VehicleMoved", (delta) => {
@@ -85,6 +157,15 @@ client.on("VehicleMoved", (delta) => {
   s.targetX = delta.x;
   s.targetY = delta.y;
   s.currentFloor = delta.floor;
+
+  if (state.options.autoFollowFloor && state.selectedSessionId === delta.vehicleSessionId && state.selectedFloor !== delta.floor) {
+    selectFloor(delta.floor);
+  }
+
+  updateFloorBadges();
+  if (state.selectedSessionId === delta.vehicleSessionId) {
+    renderInspectorBar();
+  }
 });
 
 client.on("LedPanelUpdated", (panel) => {
@@ -99,9 +180,51 @@ client.on("MetricsTick", (metrics) => {
   renderMetrics(metrics);
 });
 
+function spawnDepartureGhost(bay) {
+  const parent = state.bayParentsById.get(bay.nodeId);
+  const exitPt = bay.floor === 0
+    ? { x: 0, y: bay.y < 30 ? 10 : 50 }
+    : { x: 5, y: 30 };
+
+  const waypoints = [];
+  if (parent) {
+    waypoints.push({ x: parent.x, y: parent.y });
+    if (bay.floor === 0) {
+      waypoints.push({ x: 10, y: parent.y < 30 ? 10 : 50 });
+    } else {
+      waypoints.push({ x: 10, y: parent.y });
+      waypoints.push({ x: 10, y: 30 });
+    }
+  }
+  waypoints.push(exitPt);
+
+  const first = waypoints[0];
+  state.departingGhosts.push({
+    x: bay.x,
+    y: bay.y,
+    floor: bay.floor,
+    headingRad: Math.atan2(first.y - bay.y, first.x - bay.x),
+    waypoints,
+    waypointIdx: 0
+  });
+}
+
+function computeRouteInitialHeading(session, startNode) {
+  const nodeIds = session.route?.nodeIds || [];
+  if (nodeIds.length >= 2) {
+    const n0 = state.nodesById.get(nodeIds[0]);
+    const n1 = state.nodesById.get(nodeIds[1]);
+    if (n0 && n1 && (n0.x !== n1.x || n0.y !== n1.y)) {
+      return Math.atan2(n1.y - n0.y, n1.x - n0.x);
+    }
+  }
+  return startNode && startNode.x > 80 ? Math.PI : 0;
+}
+
 function upsertSession(session, isRerouted) {
   const startNode = state.nodesById.get(session.lastKnownNodeId || session.route.nodeIds[0]);
   const existing = state.sessions.get(session.vehicleSessionId);
+  const initialHeading = computeRouteInitialHeading(session, startNode);
 
   state.sessions.set(session.vehicleSessionId, {
     ...session,
@@ -109,18 +232,37 @@ function upsertSession(session, isRerouted) {
     renderY: existing ? existing.renderY : startNode ? startNode.y : 10,
     targetX: startNode ? startNode.x : 0,
     targetY: startNode ? startNode.y : 10,
+    headingRad: existing ? existing.headingRad : initialHeading,
     currentFloor: startNode ? startNode.floor : 0,
     rerouteFlashUntil: isRerouted ? performance.now() + 3000 : 0,
-    stepCursor: 0,
-    parkedAtMs: 0
+    stepCursor: existing && existing.assignedBayId === session.assignedBayId ? existing.stepCursor : 0
   });
 }
 
-function logEvent(text, kind) {
+function logEvent(text, kind, target = null) {
   const li = document.createElement("li");
   li.className = kind;
   const ts = new Date().toLocaleTimeString([], { hour12: false });
   li.textContent = `[${ts}] ${text}`;
+
+  if (target?.bayId || target?.sessionId) {
+    li.classList.add("clickable");
+    li.title = "Click to jump to bay/vehicle";
+    li.addEventListener("click", () => {
+      if (target.sessionId && state.sessions.has(target.sessionId)) {
+        selectSession(target.sessionId, true);
+      } else if (target.bayId) {
+        const b = state.baysById.get(target.bayId);
+        if (b) {
+          selectFloor(b.floor);
+          state.selectedSessionId = null;
+          state.selectedBayId = b.bayId;
+          renderInspectorBar();
+        }
+      }
+    });
+  }
+
   eventFeed.prepend(li);
   while (eventFeed.children.length > 35) {
     eventFeed.removeChild(eventFeed.lastChild);
@@ -139,6 +281,15 @@ function applySnapshot(snapshot) {
     state.baysById.set(bay.bayId, bay);
   }
 
+  state.bayParentsById.clear();
+  for (const edge of snapshot.edges) {
+    const fromNode = state.nodesById.get(edge.fromNodeId);
+    const toNode = state.nodesById.get(edge.toNodeId);
+    if (fromNode && toNode && toNode.type === "Bay") {
+      state.bayParentsById.set(toNode.id, fromNode);
+    }
+  }
+
   state.sessions.clear();
   for (const session of snapshot.activeSessions) {
     upsertSession(session, false);
@@ -154,19 +305,40 @@ function applySnapshot(snapshot) {
     renderMetrics(snapshot.metrics);
   }
 
+  if (state.selectedBayId && !state.baysById.has(state.selectedBayId)) {
+    state.selectedBayId = null;
+  }
+  if (state.selectedSessionId && !state.sessions.has(state.selectedSessionId)) {
+    state.selectedSessionId = null;
+  }
+
+  refreshLiveUi();
+}
+
+function refreshLiveUi() {
   updateFloorBadges();
+  renderFleetChips();
+  renderInspectorBar();
 }
 
 function updateFloorBadges() {
   for (let floor = 0; floor < 3; floor++) {
     let freeCount = 0;
     for (const bay of state.baysById.values()) {
-      if (bay.floor === floor && bay.status === "Free") {
-        freeCount++;
-      }
+      if (bay.floor === floor && bay.status === "Free") freeCount++;
     }
-    const el = document.getElementById(`floorBadge${floor}`);
-    if (el) el.textContent = `${freeCount} free`;
+    const freeEl = document.getElementById(`floorBadge${floor}`);
+    if (freeEl) freeEl.textContent = String(freeCount);
+
+    let carCount = 0;
+    for (const s of state.sessions.values()) {
+      if (s.currentFloor === floor) carCount++;
+    }
+    const carEl = document.getElementById(`floorCars${floor}`);
+    if (carEl) {
+      carEl.textContent = `●${carCount}`;
+      carEl.classList.toggle("hidden", carCount === 0);
+    }
   }
 }
 
@@ -189,40 +361,193 @@ function renderMetrics(m) {
     `${m.freeBays} / ${m.leasedBays} / ${m.occupiedBays} / ${m.outOfServiceBays ?? 0}`;
 }
 
-function getCanvasLayout() {
-  const width = canvas.clientWidth;
-  const height = canvas.clientHeight;
-  const padX = 48;
-  const padY = 42;
-  const scaleX = (width - padX * 2) / 100;
-  const scaleY = (height - padY * 2) / 60;
-  return {
-    width,
-    height,
-    scaleX,
-    scaleY,
-    boxW: Math.max(24, scaleX * 3.8),
-    boxH: Math.max(18, scaleY * 3.8),
-    toX: (x) => padX + x * scaleX,
-    toY: (y) => padY + y * scaleY
-  };
-}
+function renderFleetChips() {
+  const active = Array.from(state.sessions.values());
+  fleetCountCodeEl.textContent = `${active.length} LIVE`;
 
-function findBayAtCanvasPoint(canvasX, canvasY) {
-  const layout = getCanvasLayout();
-  const halfW = layout.boxW / 2;
-  const halfH = layout.boxH / 2;
-
-  for (const bay of state.baysById.values()) {
-    if (bay.floor !== state.selectedFloor) continue;
-    const bx = layout.toX(bay.x);
-    const by = layout.toY(bay.y);
-    if (Math.abs(canvasX - bx) <= halfW && Math.abs(canvasY - by) <= halfH) {
-      return bay;
-    }
+  if (active.length === 0) {
+    const empty = document.createElement("span");
+    empty.className = "fleet-empty";
+    empty.textContent = "No vehicles currently navigating";
+    fleetChipsEl.replaceChildren(empty);
+    return;
   }
 
-  return null;
+  const now = performance.now();
+  const chips = active.map((s) => {
+    const btn = document.createElement("button");
+    btn.type = "button";
+    btn.className = "btn fleet-chip";
+    if (state.selectedSessionId === s.vehicleSessionId) btn.classList.add("selected");
+    if (s.rerouteFlashUntil > now) btn.classList.add("rerouted");
+    btn.textContent = `${s.vehicleSessionId.slice(-6)} · F${s.currentFloor}→${s.assignedBayId.replace(/^F\d-/, "")}`;
+    btn.title = `${s.vehicleSessionId} (${s.vehicleType}) -> ${s.assignedBayId}. Click to follow.`;
+    btn.addEventListener("click", () => selectSession(s.vehicleSessionId, true));
+    return btn;
+  });
+
+  fleetChipsEl.replaceChildren(...chips);
+}
+
+function makeInspectorButton(label, cls, onClick) {
+  const btn = document.createElement("button");
+  btn.type = "button";
+  btn.className = `btn small ${cls}`;
+  btn.textContent = label;
+  btn.addEventListener("click", onClick);
+  return btn;
+}
+
+function renderInspectorBar() {
+  const session = state.selectedSessionId ? state.sessions.get(state.selectedSessionId) : null;
+  const bay = !session && state.selectedBayId ? state.baysById.get(state.selectedBayId) : null;
+
+  if (!session && !bay) {
+    inspectorEmptyEl.classList.remove("hidden");
+    inspectorContentEl.classList.add("hidden");
+    inspectorContentEl.replaceChildren();
+    return;
+  }
+
+  inspectorEmptyEl.classList.add("hidden");
+  inspectorContentEl.classList.remove("hidden");
+
+  const meta = document.createElement("div");
+  meta.className = "inspector-meta";
+  const actions = document.createElement("div");
+  actions.className = "inspector-actions";
+
+  if (bay) {
+    const idEl = document.createElement("span");
+    idEl.className = "insp-id";
+    idEl.textContent = bay.bayId;
+
+    const statusEl = document.createElement("span");
+    statusEl.className = `insp-pill ${bay.status.toLowerCase()}`;
+    statusEl.textContent = bay.status.toUpperCase();
+
+    const typeEl = document.createElement("span");
+    typeEl.className = "insp-pill";
+    typeEl.textContent = bay.primaryType.toUpperCase();
+
+    meta.append(idEl, statusEl, typeEl);
+
+    if (bay.currentSessionId) {
+      const sessEl = document.createElement("span");
+      sessEl.className = "insp-pill";
+      sessEl.textContent = bay.currentSessionId;
+      meta.append(sessEl);
+    }
+
+    if (bay.fencingToken > 0) {
+      const fenceEl = document.createElement("span");
+      fenceEl.className = "insp-pill";
+      fenceEl.textContent = `FENCE #${bay.fencingToken}`;
+      meta.append(fenceEl);
+    }
+
+    const maintLabel = bay.status === "OutOfService" ? "Restore Free" : "Out of Service";
+    actions.append(makeInspectorButton(maintLabel, "toggle", () => toggleBayMaintenance(bay).catch(console.error)));
+
+    if (bay.status === "Occupied") {
+      actions.append(makeInspectorButton("Vacate", "primary", () => setBayOccupancy(bay.bayId, false).catch(console.error)));
+    } else if (bay.status !== "OutOfService") {
+      const label = bay.status === "Leased" ? "Intrude (Reroute)" : "Simulate Park";
+      actions.append(makeInspectorButton(label, "danger", () => setBayOccupancy(bay.bayId, true).catch(console.error)));
+    }
+
+    if (bay.status === "Leased" && bay.fencingToken > 0) {
+      actions.append(makeInspectorButton("Release Lease", "accent", () => releaseBayLease(bay).catch(console.error)));
+    }
+
+    actions.append(makeInspectorButton("Close ×", "chip", () => {
+      state.selectedBayId = null;
+      renderInspectorBar();
+    }));
+  } else if (session) {
+    const idEl = document.createElement("span");
+    idEl.className = "insp-id";
+    idEl.textContent = `${session.vehicleSessionId} (${session.vehicleType})`;
+
+    const targetEl = document.createElement("span");
+    targetEl.className = "insp-pill leased";
+    targetEl.textContent = `TARGET ${session.assignedBayId}`;
+
+    const fenceEl = document.createElement("span");
+    fenceEl.className = "insp-pill";
+    fenceEl.textContent = `FENCE #${session.fencingToken}`;
+
+    // Build clickable floor progression legs along A* path
+    const crumbs = document.createElement("span");
+    crumbs.className = "crumb-list";
+    const visitedFloors = [];
+    for (const nid of session.route?.nodeIds || []) {
+      const node = state.nodesById.get(nid);
+      if (!node) continue;
+      if (visitedFloors.length === 0 || visitedFloors[visitedFloors.length - 1] !== node.floor) {
+        visitedFloors.push(node.floor);
+      }
+    }
+
+    for (const fl of visitedFloors) {
+      const cBtn = makeInspectorButton(`F${fl}`, fl === session.currentFloor ? "crumb current" : "crumb", () => selectFloor(fl));
+      crumbs.append(cBtn);
+    }
+
+    meta.append(idEl, targetEl, fenceEl, crumbs);
+
+    actions.append(makeInspectorButton("Step →", "primary", () => advanceSingleSession(session).catch(console.error)));
+    actions.append(makeInspectorButton("Jump to Target", "accent", () => {
+      const tb = state.baysById.get(session.assignedBayId);
+      if (tb) selectFloor(tb.floor);
+    }));
+    actions.append(makeInspectorButton("Unpin ×", "chip", () => {
+      state.selectedSessionId = null;
+      refreshLiveUi();
+    }));
+  }
+
+  inspectorContentEl.replaceChildren(meta, actions);
+}
+
+function selectFloor(floor) {
+  state.selectedFloor = floor;
+  state.hoveredItem = null;
+  state.hoveredBayId = null;
+  state.hoveredSessionId = null;
+  state.hoveredRampId = null;
+  state.hoveredVmsId = null;
+  for (const el of document.querySelectorAll(".floor-tab")) {
+    el.classList.toggle("active", Number(el.dataset.floor) === state.selectedFloor);
+  }
+  updateFloorHint();
+}
+
+function selectSession(sessionId, jumpToCurrentFloor) {
+  const s = state.sessions.get(sessionId);
+  if (!s) return;
+  state.selectedBayId = null;
+  state.selectedSessionId = sessionId;
+  if (jumpToCurrentFloor) {
+    selectFloor(s.currentFloor);
+  }
+  refreshLiveUi();
+}
+
+function updateFloorHint() {
+  const titleEl = document.getElementById("canvasFloorTitle");
+  const meta = FLOOR_META[state.selectedFloor] || FLOOR_META[0];
+  const h = state.hoveredItem;
+  if (h?.kind === "bay") {
+    const nextAction = h.bay.status === "OutOfService" ? "RESTORE" : "INSPECT / SHIFT+CLICK MAINT";
+    titleEl.textContent = `STALL ${h.bay.bayId} (${h.bay.status.toUpperCase()}) · ${nextAction}`;
+  } else if (h?.kind === "vehicle") {
+    titleEl.textContent = `VEHICLE ${h.session.vehicleSessionId} · CLICK TO FOLLOW ROUTE`;
+  } else if (h?.kind === "ramp") {
+    titleEl.textContent = `RAMP PORTAL · CLICK TO JUMP TO FLOOR F${h.ramp.targetFloor}`;
+  } else {
+    titleEl.textContent = `${meta.code} · ${meta.title}`;
+  }
 }
 
 function resizeCanvas() {
@@ -234,186 +559,18 @@ function resizeCanvas() {
 }
 
 function drawFrame(now) {
-  const layout = getCanvasLayout();
-  const { width, height, toX, toY, boxW, boxH } = layout;
-  ctx.clearRect(0, 0, width, height);
-
+  const layout = getCanvasLayout(canvas);
   const floor = state.selectedFloor;
 
-  for (const edge of state.edges) {
-    const from = state.nodesById.get(edge.fromNodeId);
-    const to = state.nodesById.get(edge.toNodeId);
-    if (!from || !to) continue;
-    if (from.floor !== floor || to.floor !== floor) continue;
-
-    ctx.beginPath();
-    ctx.moveTo(toX(from.x), toY(from.y));
-    ctx.lineTo(toX(to.x), toY(to.y));
-    ctx.strokeStyle = to.type === "Bay" ? "#1e293b" : "#2b3e5c";
-    ctx.lineWidth = to.type === "Bay" ? 1.5 : 4;
-    ctx.stroke();
-  }
-
-  for (const session of state.sessions.values()) {
-    const nodeIds = session.route?.nodeIds || [];
-    const isFlash = session.rerouteFlashUntil > now;
-    ctx.beginPath();
-    let started = false;
-    for (const id of nodeIds) {
-      const node = state.nodesById.get(id);
-      if (!node || node.floor !== floor) {
-        started = false;
-        continue;
-      }
-      if (!started) {
-        ctx.moveTo(toX(node.x), toY(node.y));
-        started = true;
-      } else {
-        ctx.lineTo(toX(node.x), toY(node.y));
-      }
-    }
-    ctx.setLineDash([5, 5]);
-    ctx.strokeStyle = isFlash ? "#f43f5e" : "rgba(6, 182, 212, 0.55)";
-    ctx.lineWidth = isFlash ? 2.8 : 1.8;
-    ctx.stroke();
-    ctx.setLineDash([]);
-  }
-
-  for (const bay of state.baysById.values()) {
-    if (bay.floor !== floor) continue;
-
-    const bx = toX(bay.x);
-    const by = toY(bay.y);
-    const isMaintenance = bay.status === "OutOfService";
-    const isHovered = state.hoveredBayId === bay.bayId;
-
-    const fill = bay.status === "Free"
-      ? "rgba(16, 185, 129, 0.22)"
-      : bay.status === "Leased"
-        ? "rgba(245, 158, 11, 0.30)"
-        : isMaintenance
-          ? "rgba(100, 116, 139, 0.28)"
-          : "rgba(239, 68, 68, 0.34)";
-
-    const stroke = isHovered
-      ? "#f8fafc"
-      : bay.status === "Free"
-        ? "#10b981"
-        : bay.status === "Leased"
-          ? "#f59e0b"
-          : isMaintenance
-            ? "#94a3b8"
-            : "#ef4444";
-
-    ctx.fillStyle = fill;
-    ctx.strokeStyle = stroke;
-    ctx.lineWidth = isHovered ? 2.4 : 1.6;
-    if (isMaintenance) ctx.setLineDash([3, 3]);
-    ctx.fillRect(bx - boxW / 2, by - boxH / 2, boxW, boxH);
-    ctx.strokeRect(bx - boxW / 2, by - boxH / 2, boxW, boxH);
-    if (isMaintenance) {
-      ctx.setLineDash([]);
-      ctx.beginPath();
-      ctx.moveTo(bx - boxW / 2 + 2, by - boxH / 2 + 2);
-      ctx.lineTo(bx + boxW / 2 - 2, by + boxH / 2 - 2);
-      ctx.strokeStyle = "rgba(148, 163, 184, 0.5)";
-      ctx.lineWidth = 1;
-      ctx.stroke();
-    }
-
-    ctx.fillStyle = "#e2e8f0";
-    ctx.font = "bold 9px Inter, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(bay.bayId.replace(`F${floor}-`, ""), bx, by - 1);
-
-    ctx.fillStyle = "#94a3b8";
-    ctx.font = "8px Inter, sans-serif";
-    const tag = isMaintenance
-      ? "MAINT"
-      : bay.status === "Leased" && bay.leaseExpiresAtUtc
-        ? `${Math.max(0, Math.ceil((Date.parse(bay.leaseExpiresAtUtc) - Date.now()) / 1000))}s`
-        : bay.primaryType.toUpperCase();
-    ctx.fillText(tag, bx, by + 9);
-  }
-
-  for (const node of state.nodesById.values()) {
-    if (node.floor !== floor) continue;
-
-    const nx = toX(node.x);
-    const ny = toY(node.y);
-
-    if (node.type === "Gate") {
-      ctx.fillStyle = "#3b82f6";
-      ctx.fillRect(nx - 14, ny - 10, 28, 20);
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 9px Inter, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(node.id.replace("GATE-", ""), nx, ny + 3);
-    } else if (node.type === "Ramp") {
-      ctx.fillStyle = "#a855f7";
-      ctx.beginPath();
-      ctx.arc(nx, ny, 9, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 9px Inter, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(node.id.includes("UP") ? "▲" : "▼", nx, ny + 3);
-    }
-
-    if (node.ledPanelId) {
-      const panel = state.ledPanels.get(node.ledPanelId);
-      const flashing = panel && panel.flashUntil > now;
-      ctx.fillStyle = flashing ? "#a855f7" : "#1e293b";
-      ctx.strokeStyle = "#a855f7";
-      ctx.lineWidth = 1.2;
-      ctx.beginPath();
-      ctx.arc(nx, ny - 12, 7, 0, Math.PI * 2);
-      ctx.fill();
-      ctx.stroke();
-
-      ctx.fillStyle = "#fff";
-      ctx.font = "bold 9px Inter, sans-serif";
-      ctx.textAlign = "center";
-      ctx.fillText(directionArrow(panel?.direction), nx, ny - 9);
-    }
-  }
-
-  for (const session of state.sessions.values()) {
-    session.renderX += (session.targetX - session.renderX) * 0.16;
-    session.renderY += (session.targetY - session.renderY) * 0.16;
-
-    if (session.currentFloor !== floor) continue;
-
-    const cx = toX(session.renderX);
-    const cy = toY(session.renderY);
-    const rerouted = session.rerouteFlashUntil > now;
-
-    ctx.beginPath();
-    ctx.arc(cx, cy, 8, 0, Math.PI * 2);
-    ctx.fillStyle = rerouted ? "#f43f5e" : "#06b6d4";
-    ctx.fill();
-    ctx.strokeStyle = "#fff";
-    ctx.lineWidth = 1.6;
-    ctx.stroke();
-
-    ctx.fillStyle = "#fff";
-    ctx.font = "bold 8px Inter, sans-serif";
-    ctx.textAlign = "center";
-    ctx.fillText(session.vehicleSessionId.slice(-4), cx, cy - 11);
-  }
+  drawDeckBackground(ctx, layout, floor);
+  drawDrivingCorridors(ctx, layout, floor, state, state.options);
+  drawFloorRampsAndGates(ctx, layout, floor, state, now, state.hoveredRampId);
+  drawParkingBays(ctx, layout, floor, state, now);
+  drawNodesAndVmsSigns(ctx, layout, floor, state, now, state.hoveredVmsId);
+  drawActiveRoutesAndVehicles(ctx, layout, floor, state, now, state.options);
+  drawCadOverlay(ctx, layout, floor, state, state.hoveredItem);
 
   requestAnimationFrame(drawFrame);
-}
-
-function directionArrow(direction) {
-  switch (direction) {
-    case "Left": return "←";
-    case "Right": return "→";
-    case "UpRamp": return "▲";
-    case "DownRamp": return "▼";
-    case "Arrive": return "●";
-    default: return "→";
-  }
 }
 
 async function spawnVehicle() {
@@ -455,6 +612,73 @@ async function triggerBurst() {
   }
 }
 
+async function toggleBayMaintenance(bay) {
+  const outOfService = bay.status !== "OutOfService";
+  const res = await apiFetch(`/api/parking/bays/${encodeURIComponent(bay.bayId)}/maintenance`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ outOfService })
+  });
+  if (res.ok && document.getElementById("auditDrawer").open) {
+    await loadAuditEvents();
+  }
+}
+
+async function setBayOccupancy(bayId, occupied, occupantSessionId = null) {
+  const body = occupied
+    ? { occupied: true, occupantSessionId: occupantSessionId || `MANUAL-${String(state.demoCounter++).padStart(3, "0")}` }
+    : { occupied: false };
+  const res = await apiFetch(`/api/parking/bays/${encodeURIComponent(bayId)}/occupancy`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body)
+  });
+  if (res.ok && document.getElementById("auditDrawer").open) {
+    await loadAuditEvents();
+  }
+}
+
+async function releaseBayLease(bay) {
+  const res = await apiFetch(
+    `/api/parking/allocations/${encodeURIComponent(bay.bayId)}?fencingToken=${encodeURIComponent(bay.fencingToken)}`,
+    { method: "DELETE" }
+  );
+  if (!res.ok) {
+    logEvent(`Release rejected (${res.status}) for ${bay.bayId}.`, "occupied", { bayId: bay.bayId });
+  } else {
+    logEvent(`Released lease on ${bay.bayId} [fence:${bay.fencingToken}]`, "free", { bayId: bay.bayId });
+    if (document.getElementById("auditDrawer").open) {
+      await loadAuditEvents();
+    }
+  }
+}
+
+async function advanceSingleSession(session) {
+  const nodes = session.route?.nodeIds || [];
+  if (session.stepCursor >= nodes.length - 1) return;
+
+  session.stepCursor++;
+  const nodeId = nodes[session.stepCursor];
+  await apiFetch(`/api/parking/sessions/${encodeURIComponent(session.vehicleSessionId)}/progress`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ currentNodeId: nodeId })
+  });
+
+  if (session.stepCursor >= nodes.length - 1) {
+    await apiFetch(`/api/parking/bays/${encodeURIComponent(session.assignedBayId)}/occupancy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ occupied: true, occupantSessionId: session.vehicleSessionId })
+    });
+    state.sessions.delete(session.vehicleSessionId);
+    if (state.selectedSessionId === session.vehicleSessionId) {
+      state.selectedSessionId = null;
+    }
+    refreshLiveUi();
+  }
+}
+
 async function stepBrowserDemo() {
   if (!state.autoDemo) return;
 
@@ -471,27 +695,9 @@ async function stepBrowserDemo() {
     });
   }
 
-  for (const session of Array.from(state.sessions.values())) {
-    const nodes = session.route?.nodeIds || [];
-    if (session.stepCursor < nodes.length - 1) {
-      session.stepCursor++;
-      const nodeId = nodes[session.stepCursor];
-      await apiFetch(`/api/parking/sessions/${encodeURIComponent(session.vehicleSessionId)}/progress`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ currentNodeId: nodeId })
-      });
-
-      if (session.stepCursor >= nodes.length - 1) {
-        await apiFetch(`/api/parking/bays/${encodeURIComponent(session.assignedBayId)}/occupancy`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ occupied: true, occupantSessionId: session.vehicleSessionId })
-        });
-        state.sessions.delete(session.vehicleSessionId);
-      }
-    }
-  }
+  await Promise.allSettled(
+    Array.from(state.sessions.values()).map((session) => advanceSingleSession(session))
+  );
 
   const occupiedBays = Array.from(state.baysById.values()).filter((b) => b.status === "Occupied");
   if (occupiedBays.length > 0 && Math.random() < 0.18) {
@@ -506,29 +712,6 @@ async function stepBrowserDemo() {
   if (state.sessions.size >= 2 && Math.random() < 0.12) {
     await apiFetch("/api/parking/chaos/intruder", { method: "POST" });
   }
-}
-
-document.getElementById("floorTabs").addEventListener("click", (e) => {
-  const btn = e.target.closest(".floor-tab");
-  if (!btn) return;
-  state.selectedFloor = Number(btn.dataset.floor);
-  state.hoveredBayId = null;
-  for (const el of document.querySelectorAll(".floor-tab")) {
-    el.classList.toggle("active", Number(el.dataset.floor) === state.selectedFloor);
-  }
-  updateFloorHint();
-});
-
-function updateFloorHint(hoveredBay = null) {
-  const titleEl = document.getElementById("canvasFloorTitle");
-  if (hoveredBay) {
-    const nextAction = hoveredBay.status === "OutOfService" ? "restore Free" : "mark OutOfService";
-    titleEl.textContent = `Bay ${hoveredBay.bayId} (${hoveredBay.status}) — Click to ${nextAction}`;
-    return;
-  }
-
-  titleEl.textContent =
-    `Viewing Floor ${state.selectedFloor} — 40 Bays${state.selectedFloor === 0 ? " · 2 Entry Gates" : " · Ramp Access"} · Click any bay to toggle maintenance`;
 }
 
 async function loadAuditEvents() {
@@ -559,61 +742,14 @@ async function loadAuditEvents() {
   }
 }
 
-async function toggleBayMaintenance(bay) {
-  const outOfService = bay.status !== "OutOfService";
-  const res = await apiFetch(`/api/parking/bays/${encodeURIComponent(bay.bayId)}/maintenance`, {
-    method: "PATCH",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ outOfService })
-  });
-  if (res.ok && document.getElementById("auditDrawer").open) {
-    await loadAuditEvents();
-  }
+function toggleOption(key, btnId) {
+  state.options[key] = !state.options[key];
+  const btn = document.getElementById(btnId);
+  if (btn) btn.classList.toggle("active", state.options[key]);
 }
 
-canvas.addEventListener("mousemove", (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const bay = findBayAtCanvasPoint(e.clientX - rect.left, e.clientY - rect.top);
-  const nextId = bay ? bay.bayId : null;
-  if (state.hoveredBayId !== nextId) {
-    state.hoveredBayId = nextId;
-    canvas.style.cursor = bay ? "pointer" : "default";
-    updateFloorHint(bay);
-  }
-});
-
-canvas.addEventListener("mouseleave", () => {
-  if (state.hoveredBayId !== null) {
-    state.hoveredBayId = null;
-    canvas.style.cursor = "default";
-    updateFloorHint();
-  }
-});
-
-canvas.addEventListener("click", (e) => {
-  const rect = canvas.getBoundingClientRect();
-  const bay = findBayAtCanvasPoint(e.clientX - rect.left, e.clientY - rect.top);
-  if (bay) {
-    toggleBayMaintenance(bay).catch(console.error);
-  }
-});
-
-const auditDrawer = document.getElementById("auditDrawer");
-auditDrawer.addEventListener("toggle", () => {
-  if (auditDrawer.open) {
-    loadAuditEvents().catch(console.error);
-  }
-});
-document.getElementById("auditRefreshBtn").addEventListener("click", () => {
-  loadAuditEvents().catch(console.error);
-});
-
-document.getElementById("spawnBtn").addEventListener("click", () => spawnVehicle().catch(console.error));
-document.getElementById("intruderBtn").addEventListener("click", () => injectIntruder().catch(console.error));
-document.getElementById("burstBtn").addEventListener("click", () => triggerBurst().catch(console.error));
-
-const demoBtn = document.getElementById("demoToggleBtn");
-demoBtn.addEventListener("click", () => {
+function toggleAutoDemo() {
+  const demoBtn = document.getElementById("demoToggleBtn");
   state.autoDemo = !state.autoDemo;
   demoBtn.classList.toggle("active", state.autoDemo);
   demoBtn.textContent = `Auto-Demo: ${state.autoDemo ? "ON" : "OFF"}`;
@@ -622,6 +758,115 @@ demoBtn.addEventListener("click", () => {
   } else if (state.demoTimer) {
     clearInterval(state.demoTimer);
     state.demoTimer = null;
+  }
+}
+
+// Canvas pointer interaction
+canvas.addEventListener("mousemove", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const hit = hitTestCanvas(getCanvasLayout(canvas), state.selectedFloor, state, e.clientX - rect.left, e.clientY - rect.top);
+  state.hoveredItem = hit;
+  state.hoveredBayId = hit?.kind === "bay" ? hit.bay.bayId : null;
+  state.hoveredSessionId = hit?.kind === "vehicle" ? hit.session.vehicleSessionId : null;
+  state.hoveredRampId = hit?.kind === "ramp" ? hit.ramp.id : null;
+  state.hoveredVmsId = hit?.kind === "vms" ? hit.panelId : null;
+
+  canvas.style.cursor = hit ? "pointer" : "default";
+  updateFloorHint();
+});
+
+canvas.addEventListener("mouseleave", () => {
+  state.hoveredItem = null;
+  state.hoveredBayId = null;
+  state.hoveredSessionId = null;
+  state.hoveredRampId = null;
+  state.hoveredVmsId = null;
+  canvas.style.cursor = "default";
+  updateFloorHint();
+});
+
+canvas.addEventListener("click", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const hit = hitTestCanvas(getCanvasLayout(canvas), state.selectedFloor, state, e.clientX - rect.left, e.clientY - rect.top);
+  if (!hit) {
+    state.selectedBayId = null;
+    state.selectedSessionId = null;
+    refreshLiveUi();
+    return;
+  }
+
+  if (hit.kind === "vehicle") {
+    selectSession(hit.session.vehicleSessionId, false);
+  } else if (hit.kind === "ramp") {
+    selectFloor(hit.ramp.targetFloor);
+  } else if (hit.kind === "bay") {
+    if (e.shiftKey) {
+      toggleBayMaintenance(hit.bay).catch(console.error);
+    } else {
+      state.selectedSessionId = null;
+      state.selectedBayId = hit.bay.bayId;
+      refreshLiveUi();
+    }
+  }
+});
+
+canvas.addEventListener("dblclick", (e) => {
+  const rect = canvas.getBoundingClientRect();
+  const hit = hitTestCanvas(getCanvasLayout(canvas), state.selectedFloor, state, e.clientX - rect.left, e.clientY - rect.top);
+  if (hit?.kind === "bay") {
+    toggleBayMaintenance(hit.bay).catch(console.error);
+  } else if (hit?.kind === "vehicle") {
+    selectSession(hit.session.vehicleSessionId, true);
+    if (!state.options.autoFollowFloor) {
+      toggleOption("autoFollowFloor", "followToggleBtn");
+    }
+  }
+});
+
+// UI controls & shortcuts
+document.getElementById("floorTabs").addEventListener("click", (e) => {
+  const btn = e.target.closest(".floor-tab");
+  if (btn) selectFloor(Number(btn.dataset.floor));
+});
+
+document.getElementById("routesToggleBtn").addEventListener("click", () => toggleOption("showRoutes", "routesToggleBtn"));
+document.getElementById("heatmapToggleBtn").addEventListener("click", () => toggleOption("showHeatmap", "heatmapToggleBtn"));
+document.getElementById("followToggleBtn").addEventListener("click", () => toggleOption("autoFollowFloor", "followToggleBtn"));
+
+const auditDrawer = document.getElementById("auditDrawer");
+auditDrawer.addEventListener("toggle", () => {
+  if (auditDrawer.open) loadAuditEvents().catch(console.error);
+});
+document.getElementById("auditRefreshBtn").addEventListener("click", () => loadAuditEvents().catch(console.error));
+
+document.getElementById("spawnBtn").addEventListener("click", () => spawnVehicle().catch(console.error));
+document.getElementById("intruderBtn").addEventListener("click", () => injectIntruder().catch(console.error));
+document.getElementById("burstBtn").addEventListener("click", () => triggerBurst().catch(console.error));
+document.getElementById("demoToggleBtn").addEventListener("click", toggleAutoDemo);
+
+window.addEventListener("keydown", (e) => {
+  const tag = e.target?.tagName;
+  if (tag === "INPUT" || tag === "SELECT" || tag === "TEXTAREA") return;
+
+  if (e.key === "1") selectFloor(0);
+  else if (e.key === "2") selectFloor(1);
+  else if (e.key === "3") selectFloor(2);
+  else if (e.key === "r" || e.key === "R") toggleOption("showRoutes", "routesToggleBtn");
+  else if (e.key === "h" || e.key === "H") toggleOption("showHeatmap", "heatmapToggleBtn");
+  else if (e.key === "f" || e.key === "F") toggleOption("autoFollowFloor", "followToggleBtn");
+  else if (e.key === "s" || e.key === "S") spawnVehicle().catch(console.error);
+  else if (e.key === "i" || e.key === "I") injectIntruder().catch(console.error);
+  else if (e.key === "m" || e.key === "M") {
+    const targetBayId = state.hoveredBayId || state.selectedBayId;
+    const bay = targetBayId ? state.baysById.get(targetBayId) : null;
+    if (bay) toggleBayMaintenance(bay).catch(console.error);
+  } else if (e.code === "Space") {
+    e.preventDefault();
+    toggleAutoDemo();
+  } else if (e.key === "Escape") {
+    state.selectedBayId = null;
+    state.selectedSessionId = null;
+    refreshLiveUi();
   }
 });
 
@@ -642,9 +887,7 @@ async function setActiveTenant(nextTenant) {
 
   try {
     const hubSnapshot = await client.invoke("SubscribeTenant", nextTenant);
-    if (hubSnapshot) {
-      applySnapshot(hubSnapshot);
-    }
+    if (hubSnapshot) applySnapshot(hubSnapshot);
   } catch {
     const snapRes = await apiFetch("/api/parking/snapshot");
     if (snapRes.ok) {
@@ -670,19 +913,15 @@ tenantSelect.addEventListener("change", () => {
   }
 });
 
-applyTenantBtn.addEventListener("click", () => {
-  setActiveTenant(customTenantInput.value.trim()).catch(console.error);
-});
-
+applyTenantBtn.addEventListener("click", () => setActiveTenant(customTenantInput.value.trim()).catch(console.error));
 customTenantInput.addEventListener("keydown", (e) => {
-  if (e.key === "Enter") {
-    setActiveTenant(customTenantInput.value.trim()).catch(console.error);
-  }
+  if (e.key === "Enter") setActiveTenant(customTenantInput.value.trim()).catch(console.error);
 });
 
 async function bootstrap() {
   resizeCanvas();
   window.addEventListener("resize", resizeCanvas);
+  updateFloorHint();
 
   const res = await apiFetch("/api/parking/snapshot");
   if (res.ok) {
