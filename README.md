@@ -11,7 +11,7 @@
 [![SignalR](https://img.shields.io/badge/SignalR-Real--Time%20Deltas-512BD4?logo=dotnet&logoColor=white)](https://dotnet.microsoft.com/apps/aspnet/signalr)
 [![OpenTelemetry](https://img.shields.io/badge/OpenTelemetry-Metrics%20%26%20Tracing-000000?logo=opentelemetry&logoColor=white)](https://opentelemetry.io/)
 [![Docker](https://img.shields.io/badge/Docker-Compose-2496ED?logo=docker&logoColor=white)](https://www.docker.com/)
-[![Tests](https://img.shields.io/badge/Tests-105%20Passing-brightgreen?logo=xunit&logoColor=white)](#en-16-testing)
+[![Tests](https://img.shields.io/badge/Tests-106%20Passing-brightgreen?logo=xunit&logoColor=white)](#en-16-testing)
 [![SLO Gate](https://img.shields.io/badge/SLO%20Gate-Verified-success)](#en-23-slos)
 [![ParkMesh CI](https://github.com/DevYuriVieira/parkmesh/actions/workflows/ci.yml/badge.svg)](https://github.com/DevYuriVieira/parkmesh/actions/workflows/ci.yml)
 
@@ -43,7 +43,7 @@
 | **Edge Security & Fail-Closed Boot** | Outside `Development`, startup fails if `Security:ApiKey` is empty (unless `AllowUnauthenticatedProduction=true`) or `Security:AllowedTenants` is empty/invalid; constant-time SHA-256 `X-Api-Key`; chaos routes unmapped by default |
 | **Rehydration & Fault Recovery** | `GarageStateHydrationHostedService` restores Postgres physical/maintenance state + Redis leases across `default` and `AllowedTenants` prior to `/health/ready`; `2s` lease expiration sweeper |
 | **Observability & Probes** | OpenTelemetry (`Meter("ParkMesh.Engine")`, `ActivitySource("ParkMesh.Engine")`), `SlidingLatencyWindow` (P50/P95/P99), Prometheus `/metrics`, Grafana 11.6, `/openapi/v1.json`, `/health`, `/health/live`, `/health/ready` |
-| **Automated Testing** | **105 automated tests** (`71` unit + `26` in-process API/SignalR/security/fault-injection integration + `8` Testcontainers Redis `7.4-alpine` & PostgreSQL `17-alpine` RLS) |
+| **Automated Testing** | **106 automated tests** (`72` unit + `26` in-process API/SignalR/security/fault-injection integration + `8` Testcontainers Redis `7.4-alpine` & PostgreSQL `17-alpine` RLS) |
 | **Containerization & CI** | Multi-stage Dockerfiles running as non-root `USER app` + GitHub Actions validating Compose, `UID != 0` runtime smoke test, Cobertura coverage summary, and SLO gate |
 | **Capacity & SLO Engineering** | `--load` harness (`6,847.9 req/s`, `P95=5.33 ms`, `P99=67.99 ms`, `0` conflicts/errors) + `--capacity` memory probe (`~97.52–97.55 KiB`/tenant; practical budget `~2,500` active tenants in `512 MiB`) |
 
@@ -107,14 +107,14 @@ Real-world automated multi-floor garages break naive CRUD backends across four c
 <a id="en-2-capabilities"></a>
 ## 2. Core Capabilities
 
-- **Multi-Floor Weighted Directed Graph (`ParkingGraph` & `StandardTopologyFactory`):** Models `3` floors (`0..2`), `120` bays (`40` per floor), entry gates (`GATE-N1`, `GATE-S1`), directional lane intersections, helical inter-floor ramps with penalties, and vehicle constraints (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
+- **Multi-Floor Weighted Directed Graph (`ParkingGraph` & `StandardTopologyFactory`):** Models `3` architecturally distinct floors (`0..2` — `F0` ground lobby concourse & central VIP island, `F1` standard 5×4 transfer deck, `F2` rooftop open-air skylight atrium deck), preserving `120` bays (`40` per floor), entry gates (`GATE-N1`, `GATE-S1`), directional lane intersections, helical inter-floor ramps with penalties, and vehicle constraints (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
 - **Single-Pass Multi-Target & A\* Search (`AStarPathfinder`):** Runs a dense-indexed multi-target Dijkstra sweep with sliding k-th best cutoff for candidate bay ranking alongside admissible Euclidean A\* routing incorporating live `IEdgeCongestionTracker` weights.
 - **Full Lease & Session Lifecycle (`ParkingAllocationService`):**
   - Idempotent retries for matching `(TenantId, VehicleSessionId)` requests and `409 Conflict` rejection on mismatched gate/vehicle parameters;
   - Multi-round contention replanning when parallel callers claim a candidate bay mid-allocation;
   - Node-by-node progress tracking (`UpdateVehicleProgressAsync`), physical intrusion rerouting, fencing-validated lease release (`DELETE`), and maintenance toggling (`PATCH .../maintenance`).
 - **Edge Telemetry & Anti-Flapping (`TelemetryIngestionChannel` & `SensorReadingFilter`):** Deduplicates out-of-order sequence numbers per `(tenant, bay)` (`StaleSequence`) and requires consecutive stable readings across `StabilityWindowMs` before emitting `ConfirmedTransition`.
-- **Edge Workers (`ParkMesh.Simulator` & `ParkMesh.TelemetryWorker`):** Simulate concurrent gate fleets, ultrasonic noise, and physical intruders over Eclipse Mosquitto + REST.
+- **Edge Workers (`ParkMesh.Simulator` & `ParkMesh.TelemetryWorker`):** Simulate concurrent gate fleets, ultrasonic noise, and unauthorized bay occupancy (unreserved vehicles taking leased bays) over Eclipse Mosquitto + REST.
 
 ---
 
@@ -433,7 +433,7 @@ sequenceDiagram
     Alloc->>Hub: RouteAssigned (group tenant:garage-alpha)
     API-->>Driver: 201 Created (Session + Route + FencingToken)
 
-    Note over Broker,Hub: Physical intruder occupies bay F0-B05 without matching session
+    Note over Broker,Hub: Unreserved vehicle occupies bay F0-B05 without matching lease
     Broker->>API: Sensor confirms occupied (or POST /bays/F0-B05/occupancy)
     API->>Alloc: ReconcilePhysicalOccupancyAsync(F0-B05, occupied=true)
     Alloc->>Redis: EVAL ReleaseBayLease (fencingToken=1) + acquire replacement F0-B11
@@ -455,7 +455,7 @@ sequenceDiagram
   - `GetParkingSnapshot()`: returns full graph geometry, floors, gates, active sessions, bay states, LED states, and metrics snapshot for the connection's tenant.
   - `SubscribeTenant(string tenantId)`: validates `TenantIdValidator` and `Security:AllowedTenants`, moves the connection into group `tenant:{id}`, and returns the target tenant's initial snapshot.
 - **Server-pushed events per `tenant:{id}`:** `RouteAssigned`, `RouteReassigned`, `BayStateChanged`, `VehicleMoved`, `LedPanelUpdated`, and `1s` `MetricsTick`.
-- **Visual Dashboard (`web/`):** Zero-build HTML5 2D Canvas simulator (`app.js` + `signalr-lite.js`) with multi-floor rendering, live tenant switcher (clearing `state.ledPanels` on switch), Auto-Demo mode, and chaos triggers.
+- **Lightweight 2D Visual Simulator (`web/`):** Intentionally simple, zero-build HTML5 2D Canvas simulator (`app.js`, `canvas-view.js`, `floor-renderers.js`, `signalr-lite.js`) built to observe and manually exercise the backend engine live — rendering distinct `F0`/`F1`/`F2` layouts, clickable ramps/bays/vehicles, a corridor congestion heatmap, multi-floor auto-follow, live tenant switching (clearing `state.ledPanels` on switch), Auto-Demo, and chaos triggers.
 
 ---
 
@@ -504,7 +504,7 @@ All `/api/parking/*` routes are guarded by `ApiKeyEndpointFilter` (`X-Api-Key` w
 ### Chaos (Unmapped outside `Development` unless `EnableChaosEndpoints=true`) & Observability
 | Method | Route | Purpose | Response |
 |:---:|:---|:---|:---:|
-| `POST` | `/api/parking/chaos/intruder` | Injects intrusion on a leased bay in the current tenant (`"chaos"` rate limiter) | `200` / `409` / `429` |
+| `POST` | `/api/parking/chaos/intruder` | Simulates unauthorized occupancy on a leased bay in the current tenant (`"chaos"` rate limiter) | `200` / `409` / `429` |
 | `POST` | `/api/parking/chaos/burst?count=25` | Fires `1..60` parallel vehicle allocations across entry gates | `200` / `429` |
 | `GET` | `/api/parking/metrics` | Tenant bay counts + process-global latency/counter snapshot | `200 OK` |
 | `GET` | `/metrics` | OpenTelemetry Prometheus scrape endpoint | `200 OK` |
@@ -606,9 +606,9 @@ ParkMesh/
 │   ├── ParkMesh.TelemetryWorker/       # MQTT sensor/gate edge forwarder worker
 │   └── ParkMesh.Simulator/             # Vehicle arrival, ultrasonic chatter, and intruder simulator
 ├── tests/
-│   ├── ParkMesh.UnitTests/             # 71 unit tests (domain, A*, debounce, outbox, hydration, RLS SQL, resilience, congestion, audit)
+│   ├── ParkMesh.UnitTests/             # 72 unit tests (domain, multi-floor topology, A*, debounce, outbox, hydration, RLS SQL, resilience, congestion, audit)
 │   └── ParkMesh.IntegrationTests/      # 34 integration tests (26 in-process API/SignalR/security + 8 Testcontainers Redis/Postgres)
-└── web/                                # Zero-build HTML5 2D Canvas UI (index.html, app.js, signalr-lite.js, styles.css)
+└── web/                                # Lightweight zero-build 2D Canvas simulator for live engine visualization (index.html, styles.css, app.js, canvas-view.js, floor-renderers.js, signalr-lite.js)
 ```
 
 ---
@@ -616,11 +616,11 @@ ParkMesh/
 <a id="en-16-testing"></a>
 ## 16. Automated Testing Strategy & CI Pipeline
 
-ParkMesh maintains **105 automated tests** executed on every push/PR in [`ParkMesh CI`](.github/workflows/ci.yml):
+ParkMesh maintains **106 automated tests** executed on every push/PR in [`ParkMesh CI`](.github/workflows/ci.yml):
 
 | Suite / Stage | Count / Status | Technical Verification |
 |---|---|---|
-| `ParkMesh.UnitTests` | **71 passing** (`0` failed) | Graph invariants, edge validation & `CloneTopology()`, `InMemoryEdgeCongestionTracker` clamping, A\* heuristic & k-th cutoff, idempotent retries & contention replanning, lease TTL/monotonic fence & sweeper, planned park/depart occupancy lifecycle, `OutOfService` maintenance, `(tenant, bay)` debounce, bounded outbox drain/transient failure handling, `SecurityAndRlsTests`, query clamping & startup hydration |
+| `ParkMesh.UnitTests` | **72 passing** (`0` failed) | Multi-floor graph invariants (`F0`/`F1`/`F2`), edge validation & `CloneTopology()`, `InMemoryEdgeCongestionTracker` clamping, A\* heuristic & k-th cutoff, idempotent retries & contention replanning, lease TTL/monotonic fence & sweeper, planned park/depart occupancy lifecycle, `OutOfService` maintenance, `(tenant, bay)` debounce, bounded outbox drain/transient failure handling, `SecurityAndRlsTests`, query clamping & startup hydration |
 | `ParkMesh.IntegrationTests` (No Docker) | **26 passing** (`0` failed) | Minimal API flows, OpenAPI `/openapi/v1.json`, `/health/ready` `503 degraded` fault injection, SignalR `tenant:{id}` isolation & live switching, security/CSP headers, `ApiKeyEndpointFilter` (including `/topology`), fail-closed startup outside `Development` |
 | `ParkMesh.IntegrationTests` (Testcontainers Redis `7.4-alpine`) | **4 passing** (Linux CI) | Lua acquire/release with monotonic fencing tokens, 50-way race contention, 40 concurrent allocations without double-booking, multi-tenant Redis key isolation and rehydration |
 | `ParkMesh.IntegrationTests` (Testcontainers Postgres `17-alpine`) | **4 passing** (Linux CI) | Schema initialization, `NpgsqlBatch` persistence, latest physical/maintenance replay, and `FORCE ROW LEVEL SECURITY` fail-closed enforcement (`SQLSTATE 42501`) under restricted `parkmesh_app` role / `Postgres:AppRole` |
@@ -722,7 +722,7 @@ dotnet run --project src/ParkMesh.Simulator
 # Build Release solution
 dotnet build ParkMesh.sln -c Release
 
-# 71 unit tests
+# 72 unit tests
 dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build
 
 # 26 integration tests without Docker
@@ -844,8 +844,8 @@ Stabilized managed heap (`GC.GetTotalMemory(true)`) after provisioning `N` warme
 ## 24. Technical Audit & Quality Gate
 
 - **Zero-Warning Build:** `dotnet build ParkMesh.sln -c Release --no-restore` passes with **0 warnings and 0 errors** (`TreatWarningsAsErrors=true`, `Nullable=enable`).
-- **Passing `main` CI Pipeline (`ParkMesh CI`):** The `build-and-test` job succeeded on `ubuntu-latest`, verifying Compose validity, multi-stage image builds, non-root `USER app` container startup (`UID != 0` + `/health/ready` `200 OK`), 71 unit tests, 34 full integration tests including Testcontainers Redis and PostgreSQL 17 RLS, Cobertura coverage reporting, and the Load SLO Gate.
-- **Honest Execution Scope Disclosure:** On Windows without a local Docker Desktop daemon running, all `71` unit tests, `26` non-Docker integration tests, `--load --slo`, and `--capacity` ran locally on `main`, while the `8` Testcontainers integration suites and the live `USER app` container smoke test executed and passed on the Linux CI runner.
+- **Passing `main` CI Pipeline (`ParkMesh CI`):** The `build-and-test` job on `ubuntu-latest` verifies Compose validity, multi-stage image builds, non-root `USER app` container startup (`UID != 0` + `/health/ready` `200 OK`), the unit suite, 34 full integration tests including Testcontainers Redis and PostgreSQL 17 RLS, Cobertura coverage reporting, and the Load SLO Gate.
+- **Honest Execution Scope Disclosure:** On Windows without a local Docker Desktop daemon running, all `72` unit tests and `26` non-Docker integration tests passed locally on the current tree, while `--load --slo`, `--capacity`, the `8` Testcontainers integration suites, and the live `USER app` container smoke test passed on the baseline `main` Linux CI / benchmark run.
 
 ---
 
@@ -868,7 +868,7 @@ Stabilized managed heap (`GC.GetTotalMemory(true)`) after provisioning `N` warme
 | **Runtime & Plataforma** | .NET 10.0 (`C# 14`, `LangVersion=latest`), `Nullable=enable`, `TreatWarningsAsErrors=true`, `Directory.Packages.props` (CPM) |
 | **Motor de Roteamento em Grafo** | Grafo dirigido ponderado em 3 pisos (`0..2`, `120` baias, rampas helicoidais) com `AStarPathfinder` indexado em passada única (`ConditionalWeakTable`, `ArrayPool<T>`, `[ThreadStatic]`) |
 | **Coordenação Atômica de Leases** | Redis 7.4 via scripts Lua (`LuaScripts.AcquireBayLease`, `ReleaseBayLease`) com `SET ... PX` e **fencing tokens monotônicos** (`INCR`), ou `InMemoryBayLeaseManager` local |
-| **Consistência & Contenção** | Retries idempotentes por sessão (`409 Conflict` se parâmetros divergirem), replanejamento multi-rodada sob chegadas paralelas e reroteamento automático em invasão física (`IntrusionRerouted`) |
+| **Consistência & Contenção** | Retries idempotentes por sessão (`409 Conflict` se parâmetros divergirem), replanejamento multi-rodada sob chegadas paralelas e reroteamento automático por ocupação indevida (`IntrusionRerouted`) |
 | **Persistência & Auditoria** | Outbox assíncrono em memória (`AuditChannelSink`, canal limitado `8192` com `DropOldest` + drain no shutdown) gravando em lotes (`NpgsqlBatch`) no PostgreSQL 17 |
 | **Multi-Tenancy & Isolamento** | Tenant = garagem lógica isolada (`TenantRuntime` em memória + prefixo Redis `parkmesh:tenant:{id}:...` + PostgreSQL **`ENABLE`/`FORCE ROW LEVEL SECURITY`** + grupos SignalR `tenant:{id}`) |
 | **Ingestão de Telemetria & Debounce** | Pipeline MQTT (`MQTTnet 4.3.7` / Mosquitto 2.0) e HTTP com `TelemetryIngestionChannel` (`DropOldest`) + filtro anti-flapping (`SensorReadingFilter`) por `(tenant, bay)` |
@@ -876,7 +876,7 @@ Stabilized managed heap (`GC.GetTotalMemory(true)`) after provisioning `N` warme
 | **Segurança & Fail-Closed em Produção** | Fora de `Development`, falha no boot sem `Security:ApiKey` (salvo `AllowUnauthenticatedProduction=true`) ou `Security:AllowedTenants` válido; `X-Api-Key` via SHA-256 em tempo constante; endpoints de caos desmapeados por padrão |
 | **Reidratação & Recuperação** | `GarageStateHydrationHostedService` restaura estados físicos (Postgres) e leases ativos (Redis) para `default` + `AllowedTenants` antes de liberar `/health/ready`; sweeper de expiração a cada `2s` |
 | **Observabilidade & Sondas** | OpenTelemetry (`Meter("ParkMesh.Engine")`, `ActivitySource("ParkMesh.Engine")`), `SlidingLatencyWindow` (P50/P95/P99), Prometheus (`/metrics`), Grafana, `/openapi/v1.json`, `/health`, `/health/live`, `/health/ready` |
-| **Testes Automatizados** | **105 testes automatizados** (`71` unitários + `26` integração API/SignalR/segurança/resiliência + `8` integração Testcontainers Redis `7.4-alpine` e PostgreSQL `17-alpine` RLS) |
+| **Testes Automatizados** | **106 testes automatizados** (`72` unitários + `26` integração API/SignalR/segurança/resiliência + `8` integração Testcontainers Redis `7.4-alpine` e PostgreSQL `17-alpine` RLS) |
 | **Containerização & CI** | Dockerfiles multi-stage rodando como usuário não-root `USER app` + GitHub Actions validando Compose, smoke test `UID != 0`, Cobertura e SLO Gate |
 | **Engenharia de Capacidade & SLO** | Harness `--load` (`6.847,9 req/s`, `P95=5,33 ms`, `P99=67,99 ms`, `0` conflitos/erros) + `--capacity` (`~97,52–97,55 KiB`/tenant; orçamento prático de `~2.500` tenants em container `512 MiB`) |
 
@@ -932,7 +932,7 @@ O **ParkMesh** é um motor de roteamento inteligente e alocação de vagas para 
 Em uma garagem instrumentada por sensores ultrassônicos e cancelas automáticas, implementações CRUD tradicionais colapsam diante de quatro problemas reais:
 - **Condições de Corrida na Alocação (Double-Booking):** Dezenas de veículos cruzando múltiplas cancelas simultaneamente selecionam a mesma vaga livre mais próxima antes que a reserva anterior seja persistida. O ParkMesh resolve isso combinando `Lock` por tenant na memória e scripts Lua atômicos no Redis com **fencing tokens monotônicos**, garantindo que apenas um vencedor adquira o lease e que liberações obsoletas falhem atomicamente.
 - **Oscilação de Sensores Físicos (Sensor Flapping):** Reflexos acústicos, pedestres atravessando vagas e micro-rajadas de pacotes MQTT causam falso-positivos instantâneos. O pipeline de telemetria aplica backpressure em `Channel` limitado (`DropOldest`) e exige estabilidade temporal (`MinConsecutiveReadings` e `StabilityWindowMs`) antes de confirmar uma transição física.
-- **Invasões Físicas e Mudança Dinâmica de Topologia:** Se um motorista sem reserva ocupa uma baia com lease ativo — ou se uma vaga é colocada em manutenção (`OutOfService`) — o motor detecta o conflito, revoga o lease anterior via fencing token, limpa a congestão obsoleta das arestas e recalcula instantaneamente uma nova rota A\* a partir do último nó conhecido do veículo deslocado (`RouteReassigned`).
+- **Ocupação Indevida e Mudança Dinâmica de Topologia:** Se um motorista sem reserva ocupa uma baia com lease ativo — ou se uma vaga é colocada em manutenção (`OutOfService`) — o motor detecta o conflito, revoga o lease anterior via fencing token, limpa a congestão obsoleta das arestas e recalcula instantaneamente uma nova rota A\* a partir do último nó conhecido do veículo deslocado (`RouteReassigned`).
 - **Desacoplamento de Auditoria e Isolamento Multi-Tenant:** O caminho crítico de alocação permanece sub-milissegundo desacoplando a escrita relacional por meio de um outbox assíncrono em lote (`AuditChannelSink → NpgsqlBatch`), enquanto cada `X-Tenant-Id` opera uma garagem lógica isolada em memória, Redis, PostgreSQL RLS e SignalR.
 
 ---
@@ -940,14 +940,14 @@ Em uma garagem instrumentada por sensores ultrassônicos e cancelas automáticas
 <a id="pt-2-capacidades"></a>
 ## 2. Capacidades do Domínio (Core Capabilities)
 
-- **Topologia Multiandar em Grafo (`ParkingGraph` & `StandardTopologyFactory`):** Modela `3` pisos (`0..2`), `120` baias (`40` por piso), cancelas de entrada (`GATE-N1`, `GATE-S1`), interseções direcionadas, rampas helicoidais com penalidade de transição e compatibilidade de tipos (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
+- **Topologia Multiandar em Grafo (`ParkingGraph` & `StandardTopologyFactory`):** Modela `3` pisos arquiteturalmente distintos (`0..2` — `F0` térreo com lobby/VIP concourse oeste e ilha central VIP, `F1` deck intermediário 5×4 padrão, `F2` cobertura aberta com átrio/clarabóia), mantendo `120` baias (`40` por piso), cancelas de entrada (`GATE-N1`, `GATE-S1`), interseções direcionadas, rampas helicoidais com penalidade de transição e compatibilidade de tipos (`Standard`, `EV`, `SUV`, `Pcd`, `Moto`).
 - **Busca Multi-Alvo e Roteamento A\* (`AStarPathfinder`):** Executa varredura multi-alvo em passada única com corte antecipado pelos *k* melhores candidatos para descoberta de vagas disponíveis e A\* com heurística euclidiana admissível considerando congestão dinâmica das vias (`IEdgeCongestionTracker`).
 - **Ciclo Completo de Lease e Sessão (`ParkingAllocationService`):**
   - Alocação idempotente para o mesmo `(TenantId, VehicleSessionId)` com os mesmos parâmetros, retornando `409 Conflict` se cancela ou tipo de veículo divergirem;
   - Replanejamento em múltiplas rodadas sob contenção paralela quando outro worker arremata a vaga escolhida antes da confirmação no Redis;
-  - Progresso do veículo ao longo dos nós (`UpdateVehicleProgressAsync`), detecção de invasores, liberação validada por `fencingToken` (`DELETE`) e alternância operacional para manutenção (`PATCH .../maintenance`).
+  - Progresso do veículo ao longo dos nós (`UpdateVehicleProgressAsync`), detecção de ocupação indevida, liberação validada por `fencingToken` (`DELETE`) e alternância operacional para manutenção (`PATCH .../maintenance`).
 - **Pipeline Anti-Flapping de Borda (`TelemetryIngestionChannel` & `SensorReadingFilter`):** Ordena sequências por `(tenant, bay)`, descarta pacotes fora de ordem (`StaleSequence`) e filtra ruído até atingir `MinConsecutiveReadings` dentro de `StabilityWindowMs`.
-- **Simulador & Worker Desacoplados (`ParkMesh.Simulator` & `ParkMesh.TelemetryWorker`):** Geram rajadas de veículos, ruído ultrassônico e invasões físicas sobre Mosquitto MQTT + REST para exercitar o motor de ponta a ponta.
+- **Simulador & Worker Desacoplados (`ParkMesh.Simulator` & `ParkMesh.TelemetryWorker`):** Geram rajadas de veículos, ruído ultrassônico e ocupações indevidas sobre Mosquitto MQTT + REST para exercitar o motor de ponta a ponta.
 
 ---
 
@@ -959,7 +959,7 @@ O sistema separa o caminho crítico de baixa latência (grafo em memória + Redi
 ```mermaid
 flowchart TD
     subgraph EdgeLayer ["Camada de Borda & Simulação"]
-        Sim["ParkMesh.Simulator\n(Chegadas, Ruído, Invasores)"]
+        Sim["ParkMesh.Simulator\n(Chegadas, Ruído, Ocupação Indevida)"]
         Mosq["Eclipse Mosquitto 2.0\n(MQTT Broker :1883)"]
         Worker["ParkMesh.TelemetryWorker\n(Edge Forwarder HTTP)"]
     end
@@ -1143,7 +1143,7 @@ Requisição HTTP / Transição Confirmada por Sensor
 1. **Monotonicidade Estrita de Fencing Token:** `ParkingBay.TrySetLeased` rejeita qualquer token menor ou igual ao último `FencingToken` observado na baia (`fencingToken <= FencingToken.Value`), enquanto o Redis gera tokens crescentes via `INCR` no chaveamento da vaga.
 2. **Idempotência de Sessão vs Conflito Explícito:** Repetir `POST /api/parking/allocations` com mesmo `VehicleSessionId`, `GateId` e `VehicleType` enquanto o lease está ativo retorna a sessão existente; alterar parâmetros devolve `409 Conflict` para impedir que uma sessão retenha duas vagas.
 3. **Replanejamento Sob Contenção Paralela:** Se outro worker adquirir o lease no Redis entre a consulta A\* e o `AcquireBayLease`, `ParkingAllocationService` contabiliza `ContentionRetriesTotal` e tenta o próximo candidato compatível antes de falhar.
-4. **Invasão Física e Auto-Recuperação (`IntrusionRerouted`):** Quando `ReconcilePhysicalOccupancyAsync` recebe `occupied: true` para uma vaga em estado `Leased` com sessão divergente, a vaga muda para `Occupied`, o lease antigo é revogado pelo `fencingToken`, a sessão legítima é reroteada via A\* a partir de `LastKnownNodeId` para nova baia e o evento `RouteReassigned` redireciona cliente e painéis LED.
+4. **Ocupação Indevida e Auto-Recuperação (`IntrusionRerouted`):** Quando `ReconcilePhysicalOccupancyAsync` recebe `occupied: true` para uma vaga em estado `Leased` com sessão divergente, a vaga muda para `Occupied`, o lease antigo é revogado pelo `fencingToken`, a sessão legítima é reroteada via A\* a partir de `LastKnownNodeId` para nova baia e o evento `RouteReassigned` redireciona cliente e painéis LED.
 5. **Manutenção Operacional Segura (`OutOfService`):** Marcar uma vaga em manutenção com `PATCH .../maintenance` revoga eventual lease ativo, redireciona o veículo impactado (se houver vaga livre compatível) e impede novas rotas para aquela baia até sua restauração.
 
 ---
@@ -1244,7 +1244,7 @@ Para manter a latência de alocação e conciliação física livre de bloqueios
 <a id="pt-10-mqtt-signalr"></a>
 ## 10. Telemetria MQTT de Borda e Protocolo de Deltas SignalR
 
-### Fluxo Ponta a Ponta (Alocação, Invasão Física, Reroteamento e Deltas)
+### Fluxo Ponta a Ponta (Alocação, Ocupação Indevida, Reroteamento e Deltas)
 
 ```mermaid
 sequenceDiagram
@@ -1266,7 +1266,7 @@ sequenceDiagram
     Alloc->>Hub: RouteAssigned (grupo tenant:shopping-norte)
     API-->>Driver: 201 Created (Session + Route + FencingToken)
 
-    Note over Broker,Hub: Invasor ocupa a baia F0-B05 sem reserva confirmada
+    Note over Broker,Hub: Veículo sem reserva ocupa a baia F0-B05 já alocada
     Broker->>API: Sensor confirma ocupado (ou POST /bays/F0-B05/occupancy)
     API->>Alloc: ReconcilePhysicalOccupancyAsync(F0-B05, occupied=true)
     Alloc->>Redis: EVAL ReleaseBayLease (fencingToken=1) + adquire nova baia F0-B11 (token=1)
@@ -1288,7 +1288,7 @@ sequenceDiagram
   - `GetParkingSnapshot()`: retorna geometria completa do grafo, pisos, cancelas, sessões ativas, estado das baias, painéis LED e snapshot de métricas para o tenant atual.
   - `SubscribeTenant(string tenantId)`: valida formato (`TenantIdValidator`) e `Security:AllowedTenants`, alterna o grupo SignalR da conexão (`tenant:{id}`) e devolve o snapshot inicial.
 - **Eventos transmitidos por grupo `tenant:{id}`:** `RouteAssigned`, `RouteReassigned`, `BayStateChanged`, `VehicleMoved`, `LedPanelUpdated` e heartbeat `MetricsTick` (`1s`).
-- **Interface Visual (`web/`):** Cliente zero-build em HTML5 Canvas 2D (`app.js`) com cliente WebSocket customizado (`signalr-lite.js`), seleção dinâmica de pisos/tenants (limpando `state.ledPanels` ao trocar), modo Auto-Demo e triggers de caos.
+- **Simulação Visual 2D (`web/`):** Simulador HTML5 Canvas 2D leve e zero-build (`app.js`, `canvas-view.js`, `floor-renderers.js`, `signalr-lite.js`), pensado apenas para visualizar o motor ao vivo e testar cenários manualmente — com plantas distintas por andar (`F0`/`F1`/`F2`), rampas/baias/veículos clicáveis, mapa de calor de congestão nos corredores, *auto-follow* entre pisos, troca dinâmica de tenant (limpando `state.ledPanels`), Auto-Demo em paralelo e triggers de caos.
 
 ---
 
@@ -1329,7 +1329,7 @@ Todas as rotas `/api/parking/*` são protegidas por `ApiKeyEndpointFilter` (`X-A
 | `POST` | `/api/parking/allocations` | Aloca rota ótima e adquire lease com `fencingToken` | `201` / `409` |
 | `DELETE` | `/api/parking/allocations/{bayId}?fencingToken=...` | Libera lease validando o `fencingToken` | `204` / `409` |
 | `POST` | `/api/parking/sessions/{sessionId}/progress` | Atualiza `LastKnownNodeId` ao longo da rota | `200` / `404` |
-| `POST` | `/api/parking/bays/{bayId}/occupancy` | Confirma ocupação/desocupação física (dispara reroteamento em invasão) | `200` / `404` |
+| `POST` | `/api/parking/bays/{bayId}/occupancy` | Confirma ocupação/desocupação física (dispara reroteamento em ocupação indevida) | `200` / `404` |
 | `PATCH` | `/api/parking/bays/{bayId}/maintenance` | Alterna `OutOfService` / `Free` (deslocando sessão ativa se necessário) | `200` / `404` |
 | `POST` | `/api/parking/telemetry/readings` | Enfileira leitura de sensor HTTP carimbada com `ITenantContext` | `202` / `503` |
 | `GET` | `/api/parking/telemetry/metrics` | Contadores do canal de ingestão de telemetria | `200 OK` |
@@ -1337,7 +1337,7 @@ Todas as rotas `/api/parking/*` são protegidas por `ApiKeyEndpointFilter` (`X-A
 ### Caos (Desmapeado fora de `Development` sem `EnableChaosEndpoints=true`) e Observabilidade
 | Método | Rota | Objetivo | Resposta |
 |:---:|:---|:---|:---:|
-| `POST` | `/api/parking/chaos/intruder` | Simula invasão em uma vaga com lease ativo no tenant (Rate Limit `"chaos"`) | `200` / `409` / `429` |
+| `POST` | `/api/parking/chaos/intruder` | Simula ocupação indevida em uma vaga com lease ativo no tenant (Rate Limit `"chaos"`) | `200` / `409` / `429` |
 | `POST` | `/api/parking/chaos/burst?count=25` | Dispara rajada de `1..60` alocações concorrentes nas cancelas | `200` / `429` |
 | `GET` | `/api/parking/metrics` | Snapshot de baias do tenant + latências/contadores globais do motor | `200 OK` |
 | `GET` | `/metrics` | Endpoint de coleta Prometheus (OpenTelemetry) | `200 OK` |
@@ -1357,7 +1357,7 @@ curl -X POST "http://localhost:5150/api/parking/allocations" \
   -H "X-Api-Key: dev-secret-if-configured" \
   -d '{"gateId":"GATE-N1","vehicleSessionId":"CAR-101","vehicleType":"EV","leaseSeconds":90}'
 
-# 2. Confirmar ocupação física por invasor (dispara detecção + RouteReassigned via SignalR)
+# 2. Confirmar ocupação física indevida por veículo sem reserva (dispara detecção + RouteReassigned via SignalR)
 curl -X POST "http://localhost:5150/api/parking/bays/F0-B05/occupancy" \
   -H "Content-Type: application/json" \
   -H "X-Tenant-Id: shopping-norte" \
@@ -1437,11 +1437,11 @@ ParkMesh/
 │   ├── ParkMesh.Infrastructure/        # Redis Lua, Postgres RLS + NpgsqlBatch, MQTTnet, DI
 │   ├── ParkMesh.Api/                   # Minimal APIs, SignalR Hub, Segurança/Middleware, HostedServices, Dockerfiles
 │   ├── ParkMesh.TelemetryWorker/       # Worker MQTT -> API REST
-│   └── ParkMesh.Simulator/             # Simulador concorrente de chegadas, ruído e invasões
+│   └── ParkMesh.Simulator/             # Simulador concorrente de chegadas, ruído e ocupação indevida
 ├── tests/
-│   ├── ParkMesh.UnitTests/             # 71 testes unitários (domínio, A*, debouncing, outbox, hidratação, RLS SQL, falhas, congestão, auditoria)
+│   ├── ParkMesh.UnitTests/             # 72 testes unitários (domínio, topologia multiandar, A*, debouncing, outbox, hidratação, RLS SQL, falhas, congestão, auditoria)
 │   └── ParkMesh.IntegrationTests/      # 34 testes integrados (26 in-process API/SignalR/segurança + 8 Testcontainers Redis/Postgres)
-└── web/                                # Simulador Canvas 2D zero-build (index.html, app.js, signalr-lite.js, styles.css)
+└── web/                                # Simulador visual 2D leve e zero-build para acompanhar o motor ao vivo (index.html, styles.css, app.js, canvas-view.js, floor-renderers.js, signalr-lite.js)
 ```
 
 ---
@@ -1449,11 +1449,11 @@ ParkMesh/
 <a id="pt-16-testes"></a>
 ## 16. Estratégia de Testes Automatizados e Pipeline CI
 
-A suíte conta com **105 testes automatizados** validados continuamente pelo workflow [`ParkMesh CI`](.github/workflows/ci.yml):
+A suíte conta com **106 testes automatizados** validados continuamente pelo workflow [`ParkMesh CI`](.github/workflows/ci.yml):
 
 | Suíte / Etapa | Quantidade / Evidência | Cobertura Técnica |
 |---|---|---|
-| `ParkMesh.UnitTests` | **71 aprovados** (`0` falhas) | Topologia, validação de arestas e `CloneTopology()`, `InMemoryEdgeCongestionTracker`, heurística e busca multi-alvo A\*, idempotência e replanejamento, TTL/fencing monotônico e expiração proativa, ciclo completo de chegada/saída planejada, manutenção `OutOfService`, debounce `(tenant, bay)`, drain e falha transitória de outbox, `SecurityAndRlsTests`, clamping e hidratação |
+| `ParkMesh.UnitTests` | **72 aprovados** (`0` falhas) | Invariantes do grafo multiandar (`F0`/`F1`/`F2`), validação de arestas e `CloneTopology()`, `InMemoryEdgeCongestionTracker`, heurística e busca multi-alvo A\*, idempotência e replanejamento, TTL/fencing monotônico e expiração proativa, ciclo completo de chegada/saída planejada, manutenção `OutOfService`, debounce `(tenant, bay)`, drain e falha transitória de outbox, `SecurityAndRlsTests`, clamping e hidratação |
 | `ParkMesh.IntegrationTests` (Sem Docker) | **26 aprovados** (`0` falhas) | Endpoints Minimal API, OpenAPI `/openapi/v1.json`, `/health/ready` `503 degraded` sob falha simulada, entrega em grupos SignalR `tenant:{id}`, cabeçalhos de segurança/CSP, `ApiKeyEndpointFilter` (inclusive `/topology`), fail-closed startup fora de `Development` |
 | `ParkMesh.IntegrationTests` (Testcontainers Redis `7.4-alpine`) | **4 aprovados** (CI Linux) | Aquisição/liberação Lua com fencing tokens, contenção paralela 50-way, 40 alocações paralelas sem double-book, isolamento de chaves multi-tenant e reidratação |
 | `ParkMesh.IntegrationTests` (Testcontainers Postgres `17-alpine`) | **4 aprovados** (CI Linux) | Schema/índices, `NpgsqlBatch` em lote, estados físicos mais recentes e validação real de `FORCE ROW LEVEL SECURITY` fail-closed (`SQLSTATE 42501`) com role restrita `parkmesh_app` e `Postgres:AppRole` (`SET LOCAL ROLE`) |
@@ -1555,7 +1555,7 @@ dotnet run --project src/ParkMesh.Simulator
 # Compilar solução em Release
 dotnet build ParkMesh.sln -c Release
 
-# 71 testes unitários
+# 72 testes unitários
 dotnet test tests/ParkMesh.UnitTests/ParkMesh.UnitTests.csproj -c Release --no-build
 
 # 26 testes de integração sem Docker (API, OpenAPI, SignalR, Segurança, Multi-Tenant)
@@ -1677,8 +1677,8 @@ Medição de heap gerenciado estabilizado (`GC.GetTotalMemory(true)`) após mate
 ## 24. Auditoria Técnica e Quality Gate
 
 - **Compilação & Análise Estática:** `dotnet build ParkMesh.sln -c Release --no-restore` concluiu com **0 avisos e 0 erros** (`TreatWarningsAsErrors=true`, `Nullable=enable`).
-- **Pipeline Verde na `main` (`ParkMesh CI`):** Job `build-and-test` concluído com sucesso no GitHub Actions (`ubuntu-latest`), incluindo validação do Docker Compose, build das 3 imagens não-root, smoke test do container `parkmesh-api` (`UID != 0` + `/health/ready` `200 OK`), 71 testes unitários, 34 testes integrados completos com Testcontainers Redis e PostgreSQL 17 RLS, resumo Cobertura e Load SLO Gate.
-- **Escopo de Execução Declarado:** No ambiente Windows sem Docker Desktop ativo, os `71` testes unitários, os `26` testes de integração sem Docker, o `--load --slo` e o `--capacity` foram validados localmente; os `8` testes Testcontainers (Redis + Postgres RLS) e o smoke test do container em execução foram validados no runner Linux do CI.
+- **Pipeline Verde na `main` (`ParkMesh CI`):** Job `build-and-test` no GitHub Actions (`ubuntu-latest`) valida Docker Compose, build das 3 imagens não-root, smoke test do container `parkmesh-api` (`UID != 0` + `/health/ready` `200 OK`), suíte unitária, 34 testes integrados completos com Testcontainers Redis e PostgreSQL 17 RLS, resumo Cobertura e Load SLO Gate.
+- **Escopo de Execução Declarado:** No ambiente Windows sem Docker Desktop ativo, os `72` testes unitários e os `26` testes de integração sem Docker foram aprovados localmente na árvore atual, enquanto o `--load --slo`, o `--capacity`, os `8` testes Testcontainers (Redis + Postgres RLS) e o smoke test do container em execução passaram na referência da `main` / CI Linux.
 
 ---
 
